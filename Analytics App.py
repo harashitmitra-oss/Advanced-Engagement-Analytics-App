@@ -1,12 +1,12 @@
 # engagement_dashboard.py
-# Robust, multi-sheet Engagement Analytics Dashboard (UG & PG compatible)
+# Fully robust, multi-sheet Engagement Analytics Dashboard (UG & PG compatible)
+# Based on user's working notebook logic + production-grade error handling
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 import plotly.express as px
-from datetime import datetime
+from collections import Counter
 
 st.set_page_config(page_title="Engagement Analytics Dashboard", layout="wide")
 
@@ -29,6 +29,19 @@ def normalize_binary(val):
         return 0
 
 
+def make_unique(columns):
+    counts = Counter()
+    new_cols = []
+    for col in columns:
+        col = str(col).strip()
+        if counts[col] == 0:
+            new_cols.append(col)
+        else:
+            new_cols.append(f"{col}_{counts[col]}")
+        counts[col] += 1
+    return new_cols
+
+
 def detect_metadata_columns(df):
     cols = [str(c).lower() for c in df.columns]
     col_map = {}
@@ -42,37 +55,61 @@ def detect_metadata_columns(df):
 
     col_map["name"] = find_col(["name", "student"])
     col_map["email"] = find_col(["email"])
+    col_map["phone"] = find_col(["phone", "mobile", "contact"])
     col_map["conversion"] = find_col(["conversion", "status"])
-    col_map["payment_date"] = find_col(["payment date", "paid on", "deposit deadline", "date of payment", "date of offer"])
+    col_map["payment_date"] = find_col(["payment date", "paid on", "date of payment", "deposit"])
     col_map["community_status"] = find_col(["community", "retention", "active"])
     col_map["lead_score"] = find_col(["lead score", "score"])
 
     return col_map
 
 
+def safe_to_datetime(series):
+    try:
+        return pd.to_datetime(series, errors="coerce")
+    except:
+        return pd.Series([pd.NaT] * len(series))
+
+
+# -----------------------------
+# Sheet Cleaning Logic (Aligned to User's Working Code)
+# -----------------------------
+
 def clean_sheet(df_raw):
     """
-    Handles:
-    - Event names in row 1 (index 1) if present
-    - Column headers in row 3 (index 3)
-    - Data starts from row 4 (index 4)
-    - Removes summary / numeric-only rows
+    Excel Structure Assumption (based on uploaded file):
+    - Row 1 (index 0): Event headers (from column 12 onwards)
+    - Row 3 (index 2): Main headers (metadata)
+    - Data starts from Row 4 (index 3)
     """
+
     df_raw = df_raw.copy()
 
-    # Detect header row (usually row 3)
-    header_row = 3 if len(df_raw) > 3 else 0
+    # Rows
+    event_header_row = 0
+    main_header_row = 2
+    data_start_row = 3
 
-    event_names_row = 1 if len(df_raw) > 1 else None
-    event_names = None
+    # Extract headers safely
+    main_headers = df_raw.iloc[main_header_row, :12].astype(str)
+    event_headers = df_raw.iloc[event_header_row, 12:].astype(str)
 
-    if event_names_row is not None:
-        event_names = df_raw.iloc[event_names_row].tolist()
+    columns = list(main_headers) + list(event_headers)
 
-    # Set headers safely
-    df = df_raw.copy()
-    df.columns = df_raw.iloc[header_row].astype(str)
-    df = df.iloc[header_row + 1 :].reset_index(drop=True)
+    df = df_raw.iloc[data_start_row:].reset_index(drop=True)
+    df.columns = columns
+
+    # Clean column names
+    df.columns = (
+        df.columns.astype(str)
+        .str.replace("\n", " ", regex=True)
+        .str.replace("\r", " ", regex=True)
+        .str.replace("\u00a0", " ", regex=True)
+        .str.strip()
+    )
+
+    # Make column names unique
+    df.columns = make_unique(df.columns)
 
     # Drop fully empty rows
     df = df.dropna(how="all")
@@ -86,7 +123,7 @@ def clean_sheet(df_raw):
 
     df = df[~df.apply(is_numeric_row, axis=1)]
 
-    return df, event_names
+    return df
 
 
 def get_event_columns(df, metadata_cols):
@@ -109,17 +146,10 @@ def compute_lead_score(df, event_cols, metadata_cols):
 
     if metadata_cols.get("community_status"):
         comm_col = metadata_cols["community_status"]
-        score += df[comm_col].astype(str).str.lower().apply(lambda x: 20 if "retained" in x or "active" in x else 0)
+        score += df[comm_col].astype(str).str.lower().apply(lambda x: 20 if "in" in x or "active" in x else 0)
 
     df["Lead Score"] = score
     return df
-
-
-def safe_to_datetime(series):
-    try:
-        return pd.to_datetime(series, errors="coerce")
-    except:
-        return pd.Series([pd.NaT] * len(series))
 
 
 # -----------------------------
@@ -138,29 +168,26 @@ if uploaded_file:
     selected_sheet = st.selectbox("Select Sheet", sheet_names)
 
     df_raw = pd.read_excel(uploaded_file, sheet_name=selected_sheet, header=None)
-    df, event_names = clean_sheet(df_raw)
+    df = clean_sheet(df_raw)
 
     metadata_cols = detect_metadata_columns(df)
     event_cols = get_event_columns(df, metadata_cols)
 
-    # Normalize event columns SAFELY
-    for col in list(event_cols):
+    # Normalize event columns safely
+    clean_event_cols = []
+    for col in event_cols:
         if col in df.columns:
-            try:
-                df[col] = df[col].apply(normalize_binary)
-            except Exception:
-                df[col] = 0
-        else:
-            # Remove invalid columns from event list
-            event_cols = [c for c in event_cols if c in df.columns]
+            df[col] = df[col].apply(normalize_binary)
+            clean_event_cols.append(col)
+    event_cols = clean_event_cols
 
-    # Compute participation count
-    df["Total Participation"] = df[event_cols].sum(axis=1) if event_cols else 0
+    # Participation count
+    df["Total Participations"] = df[event_cols].sum(axis=1) if event_cols else 0
 
     # Lead scoring
     df = compute_lead_score(df, event_cols, metadata_cols)
 
-    # Extract key columns safely
+    # Extract key columns
     name_col = metadata_cols.get("name")
     conversion_col = metadata_cols.get("conversion")
     payment_col = metadata_cols.get("payment_date")
@@ -175,7 +202,7 @@ if uploaded_file:
     # -----------------------------
 
     total_students = len(df)
-    active_students = (df["Total Participation"] > 0).sum()
+    active_students = (df["Total Participations"] > 0).sum()
 
     paid_students = 0
     if conversion_col and conversion_col in df.columns:
@@ -197,8 +224,8 @@ if uploaded_file:
 
     st.header("1️⃣ Top Participating Students")
 
-    top_participants = df.sort_values("Total Participation", ascending=False)
-    display_cols = [c for c in [name_col, "Total Participation", conversion_col, "Lead Score"] if c and c in df.columns]
+    top_participants = df.sort_values("Total Participations", ascending=False)
+    display_cols = [c for c in [name_col, "Total Participations", conversion_col, "Lead Score"] if c and c in df.columns]
 
     st.dataframe(top_participants[display_cols], use_container_width=True, height=300)
 
@@ -246,7 +273,6 @@ if uploaded_file:
                 retention_flags.append(False)
                 continue
 
-            # Retained if participated in any event
             participated_after = row[event_cols].sum() > 0 if event_cols else False
             retention_flags.append(participated_after)
 
@@ -271,7 +297,7 @@ if uploaded_file:
 
     st.header("4️⃣ Students With NO Event Participation")
 
-    no_participation_df = df[df["Total Participation"] == 0]
+    no_participation_df = df[df["Total Participations"] == 0]
     display_cols_no = [c for c in [name_col, conversion_col, payment_col] if c and c in df.columns]
 
     st.dataframe(no_participation_df[display_cols_no], use_container_width=True, height=300)
@@ -287,7 +313,7 @@ if uploaded_file:
     if conversion_col and conversion_col in df.columns:
         conv_series = df[conversion_col].astype(str).str.lower()
         paid_df = df[conv_series.str.contains("paid|admitted", na=False)]
-        paid_low_engagement = paid_df[paid_df["Total Participation"] <= 1]
+        paid_low_engagement = paid_df[paid_df["Total Participations"] <= 1]
         st.dataframe(paid_low_engagement[display_cols], use_container_width=True, height=300)
     else:
         st.info("Conversion Status column not found.")
@@ -325,9 +351,17 @@ if uploaded_file:
 
         student_row = df[df[name_col] == selected_student].iloc[0]
 
+        participation_values = []
+        for col in event_cols:
+            val = student_row[col]
+            try:
+                participation_values.append(int(val))
+            except:
+                participation_values.append(0)
+
         timeline_df = pd.DataFrame({
             "Event": event_cols,
-            "Participation": [int(student_row[col]) for col in event_cols]
+            "Participation": participation_values
         })
 
         # Break lines for non-participation
