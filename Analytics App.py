@@ -32,20 +32,39 @@ def normalize_binary(x):
     return 0
 
 
+def detect_header_rows(raw):
+    """Dynamically detect main header row by searching for 'Student Name' or similar."""
+    for i in range(0, 8):
+        row = raw.iloc[i].astype(str).str.lower()
+        if any("student" in cell and "name" in cell for cell in row):
+            return i
+    return 2  # fallback
+
+
+def detect_event_header_row(raw):
+    """Detect event header row by finding the first row with many non-null text values."""
+    for i in range(0, 8):
+        row = raw.iloc[i]
+        non_null = row.notna().sum()
+        if non_null > 10:
+            return i
+    return 0
+
+
 if uploaded_file:
     xl = pd.ExcelFile(uploaded_file)
     sheet_name = st.selectbox("Select Sheet", xl.sheet_names)
 
     raw = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=None)
 
-    # Row structure
-    event_header_row = 0
-    main_header_row = 2
-    data_start_row = 3
+    # -------------------- Dynamic Header Detection --------------------
+    main_header_row = detect_header_rows(raw)
+    event_header_row = detect_event_header_row(raw)
+    data_start_row = main_header_row + 1
 
+    # Build columns
     main_headers = raw.iloc[main_header_row, :12].astype(str)
     event_headers = raw.iloc[event_header_row, 12:].astype(str)
-
     columns = list(main_headers) + list(event_headers)
 
     df = raw.iloc[data_start_row:].reset_index(drop=True)
@@ -62,15 +81,25 @@ if uploaded_file:
 
     df.columns = make_unique(df.columns)
 
+    # Drop empty rows
+    df = df.dropna(how="all")
+
+    # Remove summary / numeric-only rows
+    df = df[~df.apply(lambda row: all(str(x).replace('.', '', 1).isdigit() for x in row if pd.notna(x)), axis=1)]
+
     # -------------------- Column Detection --------------------
     student_col = next((c for c in df.columns if "student" in c.lower() and "name" in c.lower()), None)
     conversion_col = next((c for c in df.columns if "conversion" in c.lower()), None)
     payment_date_col = next((c for c in df.columns if "payment" in c.lower() and "date" in c.lower()), None)
 
-    # Event columns = everything after first 12 columns
+    if not student_col:
+        st.error("❌ Could not detect Student Name column. Please check sheet structure.")
+        st.stop()
+
+    # Event columns = everything after the first 12 metadata columns
     event_columns = df.columns[12:].tolist()
 
-    # Normalize event values
+    # Normalize event values safely
     for col in event_columns:
         df[col] = df[col].apply(normalize_binary)
 
@@ -86,8 +115,9 @@ if uploaded_file:
     not_paid_students = pd.DataFrame()
 
     if conversion_col:
-        paid_students = df[df[conversion_col].astype(str).str.lower().isin(["admitted", "paid", "yes"])]
-        will_pay_students = df[df[conversion_col].astype(str).str.lower().str.contains("will", na=False)]
+        conv_series = df[conversion_col].astype(str).str.lower().str.strip()
+        paid_students = df[conv_series.isin(["admitted", "paid", "yes"])]
+        will_pay_students = df[conv_series.str.contains("will", na=False)]
         not_paid_students = df[~df.index.isin(paid_students.index) & ~df.index.isin(will_pay_students.index)]
 
     conversion_rate = (len(paid_students) / active_students * 100) if active_students > 0 else 0
@@ -115,21 +145,21 @@ if uploaded_file:
         if not paid_students.empty:
             st.dataframe(paid_students[[student_col, conversion_col]], use_container_width=True)
         else:
-            st.info("No paid/admitted students found.")
+            st.warning("No paid/admitted students found.")
 
     with colB:
         st.subheader("🟡 Will Pay")
         if not will_pay_students.empty:
             st.dataframe(will_pay_students[[student_col, conversion_col]], use_container_width=True)
         else:
-            st.info("No will-pay students found.")
+            st.warning("No will-pay students found.")
 
     with colC:
         st.subheader("🔴 Not Paid")
         if not not_paid_students.empty:
             st.dataframe(not_paid_students[[student_col, conversion_col]], use_container_width=True)
         else:
-            st.info("No not-paid students found.")
+            st.warning("No not-paid students found.")
 
     # -------------------- 3️⃣ Retention Analysis (PG Only) --------------------
     st.header("3️⃣ Retention Analysis")
@@ -143,7 +173,6 @@ if uploaded_file:
             if pd.isna(pay_date):
                 retained_flags.append(0)
             else:
-                # Retained if participated in ANY event (after admission)
                 retained_flags.append(1 if row[event_columns].sum() > 0 else 0)
 
         df["Retained"] = retained_flags
@@ -154,7 +183,7 @@ if uploaded_file:
         retained_students = df[df["Retained"] == 1]
         col2.dataframe(retained_students[[student_col, payment_date_col, "Retained"]], use_container_width=True)
     else:
-        st.info("Retention analysis not available for this sheet (no Payment Date column).")
+        st.error("❌ Payment Date column not detected — retention analysis skipped.")
 
     # -------------------- 4️⃣ Students With NO Event Participation --------------------
     st.header("4️⃣ Students With NO Event Participation")
@@ -172,7 +201,7 @@ if uploaded_file:
         paid_low_engagement = paid_students[paid_students["Total Participations"] <= 1]
         st.dataframe(paid_low_engagement[[student_col, "Total Participations", conversion_col]], use_container_width=True)
     else:
-        st.info("No paid/admitted students found.")
+        st.warning("No paid/admitted students found.")
 
     # -------------------- 6️⃣ Event-wise Participation --------------------
     st.header("6️⃣ Event-wise Participation")
@@ -184,7 +213,7 @@ if uploaded_file:
     st.plotly_chart(fig_event, use_container_width=True)
     st.dataframe(event_df, use_container_width=True)
 
-    # -------------------- Heatmap (From Your Jupyter Code) --------------------
+    # -------------------- Heatmap --------------------
     st.subheader("🔥 Student Participation Heatmap")
     heatmap_df = df[df["Total Participations"] > 0][event_columns]
     if not heatmap_df.empty:
@@ -198,10 +227,10 @@ if uploaded_file:
     else:
         st.info("No participation data available for heatmap.")
 
-    # -------------------- 7️⃣ Per-Student Participation Timeline --------------------
+    # -------------------- 7️⃣ Per-Student Participation Timeline (DATE-AWARE) --------------------
     st.header("7️⃣ Per-Student Participation Timeline")
-    selected_student = st.selectbox("Select Student", df[student_col].dropna().unique())
 
+    selected_student = st.selectbox("Select Student", df[student_col].dropna().unique())
     student_row = df[df[student_col] == selected_student].iloc[0]
 
     timeline_df = pd.DataFrame({
@@ -209,29 +238,46 @@ if uploaded_file:
         "Participation": [int(student_row[col]) for col in event_columns]
     })
 
-    timeline_df["Sequence"] = range(1, len(timeline_df) + 1)
+    # Attempt to extract event dates from event headers
+    def extract_date(text):
+        try:
+            return pd.to_datetime(text, errors="coerce")
+        except:
+            return pd.NaT
+
+    timeline_df["Event Date"] = timeline_df["Event"].apply(extract_date)
+
+    # Use event dates if available, otherwise use sequence
+    if timeline_df["Event Date"].notna().sum() > 0:
+        timeline_df = timeline_df.sort_values(by="Event Date")
+        x_axis = "Event Date"
+    else:
+        timeline_df["Sequence"] = range(1, len(timeline_df) + 1)
+        x_axis = "Sequence"
 
     fig_timeline = px.line(
         timeline_df[timeline_df["Participation"] == 1],
-        x="Sequence",
+        x=x_axis,
         y="Participation",
         markers=True,
         title=f"Participation Timeline – {selected_student}",
     )
 
+    # Add payment date marker
     if payment_date_col and not pd.isna(student_row[payment_date_col]):
-        fig_timeline.add_annotation(
-            x=1,
-            y=1,
-            text="✔ Admitted",
-            showarrow=True,
-            arrowhead=2,
-            font=dict(color="green", size=14),
+        fig_timeline.add_scatter(
+            x=[student_row[payment_date_col]],
+            y=[1],
+            mode="markers+text",
+            marker=dict(color="green", size=12),
+            text=["✔ Admitted"],
+            textposition="top center",
+            name="Payment Date",
         )
 
     st.plotly_chart(fig_timeline, use_container_width=True)
 
-    # -------------------- 🏆 Lead Scoring (From Your Jupyter Code) --------------------
+    # -------------------- 🏆 Lead Scoring --------------------
     st.header("🏆 Lead Scoring")
 
     hackathon_cols = [c for c in event_columns if "hackathon" in c.lower()]
