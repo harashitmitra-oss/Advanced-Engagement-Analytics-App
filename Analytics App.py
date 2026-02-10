@@ -13,7 +13,7 @@ st.set_page_config(page_title="Engagement Analytics", layout="wide")
 def load_group_sheet(uploaded_file, sheet_name):
     raw = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=None)
 
-    # Detect header rows safely
+    # Detect header row
     header_row = None
     for i in range(5):
         if raw.iloc[i].astype(str).str.contains("student", case=False).any():
@@ -26,26 +26,21 @@ def load_group_sheet(uploaded_file, sheet_name):
     df = raw.iloc[header_row + 1:].reset_index(drop=True)
     df.columns = raw.iloc[header_row].fillna("").astype(str)
 
-    # Detect event columns dynamically (Yes/No columns)
+    # Detect event columns
     possible_event_cols = []
-    event_meta = []
-
     for col in df.columns:
-        if col.lower().startswith("m") or col.lower().startswith("session") or col.lower().startswith("event"):
+        col_l = col.lower()
+        if col_l.startswith("m") or col_l.startswith("session") or col_l.startswith("event"):
             possible_event_cols.append(col)
 
-    # Fallback: detect columns with mostly Yes/No
+    # Fallback: detect Yes/No-heavy columns
     if not possible_event_cols:
         for col in df.columns:
             sample = df[col].dropna().astype(str).str.lower()
             if sample.isin(["yes", "no", "y", "n", "1", "0"]).mean() > 0.5:
                 possible_event_cols.append(col)
 
-    # Build event meta safely
-    for col in possible_event_cols:
-        event_meta.append({"Column": col, "Event": col, "Date": None})
-
-    event_meta_df = pd.DataFrame(event_meta)
+    event_meta_df = pd.DataFrame({"Column": possible_event_cols, "Event": possible_event_cols})
 
     return df, possible_event_cols, event_meta_df
 
@@ -141,7 +136,7 @@ def plot_student_timeline(df, event_cols, student_name):
     values = [row[col] if col in df.columns else 0 for col in event_cols]
     x = list(range(1, len(values) + 1))
 
-    plt.figure(figsize=(10, 4))
+    plt.figure(figsize=(11, 4))
     plt.plot(x, values, marker="o")
     plt.xticks(x, event_cols, rotation=45, ha="right")
     plt.title(f"Participation Timeline: {student_name}")
@@ -152,7 +147,7 @@ def plot_student_timeline(df, event_cols, student_name):
     if "Date of Payment" in df.columns:
         payment_date = pd.to_datetime(row.get("Date of Payment"), errors="coerce")
         if not pd.isna(payment_date):
-            plt.scatter(x[-1], 1, marker="v", color="green", s=120)
+            plt.scatter(x[-1], 1, marker="v", color="green", s=140)
             plt.text(x[-1], 1.05, "✔ Paid", color="green")
 
     st.pyplot(plt)
@@ -215,6 +210,38 @@ def run_streamlit_app():
             st.info("No retained students detected yet.")
     else:
         st.info("Retention not calculated for this sheet (no payment date column).")
+
+    # ----------------------------- #
+    # ❌ NO PARTICIPATION STUDENTS
+    # ----------------------------- #
+    st.subheader("❌ Students With NO Event Participation")
+
+    no_participants = df[df["Total Participation"] == 0]
+
+    if not no_participants.empty:
+        cols = ["Student Name", "Conversion Status"]
+        if "Date of Payment" in df.columns:
+            cols.append("Date of Payment")
+        st.dataframe(no_participants[cols], use_container_width=True)
+    else:
+        st.success("🎉 All students have participated in at least one event.")
+
+    # ----------------------------- #
+    # ⚠️ PAID BUT LOW ENGAGEMENT
+    # ----------------------------- #
+    st.subheader("⚠️ Paid Students With Low / No Engagement")
+
+    low_engagement_paid = conv_metrics["paid_students"][
+        conv_metrics["paid_students"]["Total Participation"] <= 1
+    ]
+
+    if not low_engagement_paid.empty:
+        cols = ["Student Name", "Total Participation"]
+        if "Date of Payment" in df.columns:
+            cols.append("Date of Payment")
+        st.dataframe(low_engagement_paid[cols], use_container_width=True)
+    else:
+        st.success("👏 No paid students with low engagement!")
 
     # ----------------------------- #
     # 📊 EVENT PARTICIPATION CHART
