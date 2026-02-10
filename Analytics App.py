@@ -1,4 +1,4 @@
-# === Advanced Engagement Analytics App (PG Sheets Stable, Multi-Sheet Ready) ===
+# === Advanced Engagement Analytics App (PG Sheets Stable, Error-Free) ===
 
 import streamlit as st
 import pandas as pd
@@ -8,7 +8,7 @@ import plotly.express as px
 st.set_page_config(page_title="Engagement Analytics", layout="wide")
 
 # -------------------------------------------------------------------
-# -------------------------- DATA UTILITIES --------------------------
+# -------------------------- UTILITIES -------------------------------
 # -------------------------------------------------------------------
 
 def normalize_yes_no(series):
@@ -111,6 +111,8 @@ def student_participation_analysis(df, event_cols, event_meta_df):
 
     event_participation = (
         df[event_cols]
+        .apply(pd.to_numeric, errors="coerce")
+        .fillna(0)
         .sum()
         .reset_index()
         .rename(columns={"index": "Column", 0: "Participants"})
@@ -157,10 +159,10 @@ def run_streamlit_app():
     st.header("💰 Payment & Conversion Analysis")
 
     if conversion_col:
-        conv_series = df[conversion_col].astype(str).str.lower()
+        conv_series = df[conversion_col].astype(str).str.lower().fillna("")
 
-        paid_mask = conv_series.str.contains("paid|admitted", na=False)
-        will_pay_mask = conv_series.str.contains("will pay|will-pay|likely", na=False)
+        paid_mask = conv_series.str.contains("paid|admitted|enrolled", na=False)
+        will_pay_mask = conv_series.str.contains("will pay|likely|intent", na=False)
         not_paid_mask = ~(paid_mask | will_pay_mask)
 
         paid_students = df.loc[paid_mask, [name_col, conversion_col]]
@@ -168,8 +170,8 @@ def run_streamlit_app():
         not_paid_students = df.loc[not_paid_mask, [name_col, conversion_col]]
 
         total_students = len(df)
-        total_paid = paid_mask.sum()
-        total_will_pay = will_pay_mask.sum()
+        total_paid = int(paid_mask.sum())
+        total_will_pay = int(will_pay_mask.sum())
         conversion_rate = round((total_paid / total_students) * 100, 2) if total_students else 0
 
         col1, col2, col3, col4 = st.columns(4)
@@ -179,13 +181,13 @@ def run_streamlit_app():
         col4.metric("Conversion Rate (%)", conversion_rate)
 
         st.subheader("✅ Paid / Admitted Students")
-        st.dataframe(paid_students)
+        st.dataframe(paid_students.reset_index(drop=True))
 
         st.subheader("🟡 Will Pay Students")
-        st.dataframe(will_pay_students)
+        st.dataframe(will_pay_students.reset_index(drop=True))
 
         st.subheader("🔴 Not Paid Students")
-        st.dataframe(not_paid_students)
+        st.dataframe(not_paid_students.reset_index(drop=True))
     else:
         st.warning("⚠️ Conversion Status column not found.")
 
@@ -193,10 +195,10 @@ def run_streamlit_app():
     st.header("🔁 Retention Analysis")
 
     if community_col and payment_date_col:
-        community_series = df[community_col].astype(str).str.lower()
+        community_series = df[community_col].astype(str).str.lower().fillna("")
         payment_series = pd.to_datetime(df[payment_date_col], errors="coerce")
 
-        retained_mask = community_series.str.contains("in|retained", na=False)
+        retained_mask = community_series.str.contains("in|retained|active", na=False)
         paid_mask = payment_series.notna()
 
         retained_after_payment = retained_mask & paid_mask
@@ -206,7 +208,7 @@ def run_streamlit_app():
 
         retained_students = df.loc[retained_after_payment, [name_col, community_col, payment_date_col]]
         st.subheader("Students Retained After Payment")
-        st.dataframe(retained_students)
+        st.dataframe(retained_students.reset_index(drop=True))
     else:
         st.warning("⚠️ Community Status or Payment Date column not found.")
 
@@ -218,7 +220,7 @@ def run_streamlit_app():
     )
 
     st.subheader("Student-wise Participation")
-    st.dataframe(student_participation)
+    st.dataframe(student_participation.reset_index(drop=True))
 
     fig1 = px.bar(
         student_participation.head(30),
@@ -229,7 +231,7 @@ def run_streamlit_app():
     st.plotly_chart(fig1, use_container_width=True)
 
     st.subheader("Event-wise Participation")
-    st.dataframe(event_participation)
+    st.dataframe(event_participation.reset_index(drop=True))
 
     fig2 = px.bar(
         event_participation,
@@ -239,7 +241,7 @@ def run_streamlit_app():
     )
     st.plotly_chart(fig2, use_container_width=True)
 
-    total_participants = (student_participation["Total Events Participated"] > 0).sum()
+    total_participants = int((student_participation["Total Events Participated"] > 0).sum())
     non_participants = len(df) - total_participants
 
     fig3 = px.pie(
@@ -268,13 +270,19 @@ def run_streamlit_app():
     category_summary = []
     for category in event_meta_df["Category"].unique():
         cat_events = event_meta_df[event_meta_df["Category"] == category]["Column"].tolist()
-        cat_participations = df[cat_events].sum().sum() if cat_events else 0
-        cat_students = df.loc[df[cat_events].sum(axis=1) > 0, name_col].nunique() if cat_events else 0
+
+        if cat_events:
+            cat_df = df[cat_events].apply(pd.to_numeric, errors="coerce").fillna(0)
+            cat_participations = int(cat_df.sum().sum())
+            cat_students = int((cat_df.sum(axis=1) > 0).sum())
+        else:
+            cat_participations = 0
+            cat_students = 0
 
         category_summary.append({
             "Category": category,
-            "Total Participations": int(cat_participations),
-            "Unique Students": int(cat_students)
+            "Total Participations": cat_participations,
+            "Unique Students": cat_students
         })
 
     cat_df = pd.DataFrame(category_summary)
@@ -307,17 +315,17 @@ def run_streamlit_app():
                 df_scoring["Category Points"] += df_scoring[col] * 1
 
     if conversion_col:
-        conv_series = df_scoring[conversion_col].astype(str).str.lower()
+        conv_series = df_scoring[conversion_col].astype(str).str.lower().fillna("")
         df_scoring["Conversion Points"] = np.where(
-            conv_series.str.contains("paid|admitted", na=False), 10,
-            np.where(conv_series.str.contains("will pay|likely", na=False), 5, 0)
+            conv_series.str.contains("paid|admitted|enrolled", na=False), 10,
+            np.where(conv_series.str.contains("will pay|likely|intent", na=False), 5, 0)
         )
     else:
         df_scoring["Conversion Points"] = 0
 
     if community_col:
-        comm_series = df_scoring[community_col].astype(str).str.lower()
-        df_scoring["Retention Points"] = np.where(comm_series.str.contains("in|retained", na=False), 5, 0)
+        comm_series = df_scoring[community_col].astype(str).str.lower().fillna("")
+        df_scoring["Retention Points"] = np.where(comm_series.str.contains("in|retained|active", na=False), 5, 0)
     else:
         df_scoring["Retention Points"] = 0
 
@@ -328,12 +336,14 @@ def run_streamlit_app():
         df_scoring["Retention Points"]
     )
 
-    leaderboard = df_scoring[[name_col, "Lead Score", conversion_col if conversion_col else name_col]].sort_values(
-        "Lead Score", ascending=False
-    )
+    leaderboard_cols = [name_col, "Lead Score"]
+    if conversion_col:
+        leaderboard_cols.append(conversion_col)
+
+    leaderboard = df_scoring[leaderboard_cols].sort_values("Lead Score", ascending=False)
 
     st.subheader("Top Leads")
-    st.dataframe(leaderboard.head(30))
+    st.dataframe(leaderboard.reset_index(drop=True).head(30))
 
     fig4 = px.histogram(df_scoring, x="Lead Score", title="Lead Score Distribution")
     st.plotly_chart(fig4, use_container_width=True)
