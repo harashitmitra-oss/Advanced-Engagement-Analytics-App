@@ -49,45 +49,52 @@ def make_unique_columns(cols):
 
 
 # ----------------------------- #
-# 📥 LOAD SHEET (YOUR FORMAT)
+# 📥 LOAD SHEET (ROBUST)
 # ----------------------------- #
 @st.cache_data
 def load_group_sheet(uploaded_file, sheet_name):
     raw = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=None)
 
     # Row 0 → Event names
-    # Row 1 → Event dates
-    # Row 2 → Actual column headers
-    event_names = raw.iloc[0].fillna("").astype(str)
-    header_row = 2
+    event_names_row = raw.iloc[0].fillna("").astype(str)
 
+    # Row 2 → Actual column headers
+    header_row = 2
     headers = raw.iloc[header_row].fillna("").astype(str)
     headers = make_unique_columns(headers)
 
     df = raw.iloc[header_row + 1:].reset_index(drop=True)
     df.columns = headers
 
-    # Drop completely empty rows
+    # Drop fully empty rows
     df = df.dropna(how="all")
 
-    # Drop summary numeric rows at bottom
-    df = df[df["Student Name"].astype(str).str.strip().ne("0")]
+    # Remove summary rows (where Student Name is numeric or blank)
+    if "Student Name" in df.columns:
+        df = df[df["Student Name"].astype(str).str.strip().str.isalpha() | df["Student Name"].astype(str).str.contains(" ")]
+    else:
+        raise ValueError("Student Name column not found.")
 
-    # Detect event columns = columns between Comments and first student event column
+    # Detect metadata columns
     metadata_cols = [
         "Student Name", "E mail", "Phone Number", "Country", "Income", "Batch",
         "Data Added to the community", "Community Status", "Date of Exit",
-        "Conversion Status", "Overall Engagement Score", "Conversion Status_1",
+        "Conversion Status", "Conversion Status_1", "Overall Engagement Score",
         "Payment Date", "Comments"
     ]
 
+    # Event columns = everything else
     event_cols = [col for col in df.columns if col not in metadata_cols]
 
     # Clean event columns
     for col in event_cols:
         df[col] = normalize_yes_no(df[col])
 
-    return df, event_cols, event_names[event_names != ""].tolist()
+    # Event names aligned with event columns
+    event_names = event_names_row.iloc[df.columns.get_indexer(event_cols)].tolist()
+    event_names = [name if name != "" else f"Event {i+1}" for i, name in enumerate(event_names)]
+
+    return df.reset_index(drop=True), event_cols, event_names
 
 
 # ----------------------------- #
@@ -128,7 +135,7 @@ def conversion_and_retention_analysis(df, conversion_col, payment_date_col):
     retained_students = []
     retention_rate = 0
 
-    if payment_date_col:
+    if payment_date_col and not paid_students.empty:
         for _, row in paid_students.iterrows():
             payment_date = pd.to_datetime(row.get(payment_date_col), errors="coerce")
             if not pd.isna(payment_date) and row["Total Participation"] > 0:
@@ -152,10 +159,10 @@ def conversion_and_retention_analysis(df, conversion_col, payment_date_col):
 def plot_student_timeline(df, event_cols, event_names, student_name, payment_date_col):
     row = df[df["Student Name"] == student_name].iloc[0]
 
-    x = list(range(1, len(event_cols) + 1))
     y = [row[col] for col in event_cols]
+    x = list(range(len(y)))
 
-    labels = event_names[:len(event_cols)]
+    labels = event_names[:len(y)]
 
     plt.figure(figsize=(12, 4))
     plt.plot(x, y, marker="o")
@@ -287,7 +294,8 @@ def run_streamlit_app():
     if not event_participation.empty:
         fig, ax = plt.subplots(figsize=(10, 5))
         ax.bar(event_participation["Event"], event_participation["Participants"])
-        ax.set_xticklabels(event_participation["Event"], rotation=45, ha="right")
+        ax.set_xticks(range(len(event_participation)))
+        ax.set_xticklabels(event_names[:len(event_participation)], rotation=45, ha="right")
         ax.set_ylabel("Participants")
         ax.set_title("Event Participation Count")
         st.pyplot(fig)
