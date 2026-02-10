@@ -69,9 +69,9 @@ def clean_sheet(df_raw):
     if event_names_row is not None:
         event_names = df_raw.iloc[event_names_row].tolist()
 
-    # Set headers
+    # Set headers safely
     df = df_raw.copy()
-    df.columns = df_raw.iloc[header_row]
+    df.columns = df_raw.iloc[header_row].astype(str)
     df = df.iloc[header_row + 1 :].reset_index(drop=True)
 
     # Drop fully empty rows
@@ -143,12 +143,19 @@ if uploaded_file:
     metadata_cols = detect_metadata_columns(df)
     event_cols = get_event_columns(df, metadata_cols)
 
-    # Normalize event columns
-    for col in event_cols:
-        df[col] = df[col].apply(normalize_binary)
+    # Normalize event columns SAFELY
+    for col in list(event_cols):
+        if col in df.columns:
+            try:
+                df[col] = df[col].apply(normalize_binary)
+            except Exception:
+                df[col] = 0
+        else:
+            # Remove invalid columns from event list
+            event_cols = [c for c in event_cols if c in df.columns]
 
     # Compute participation count
-    df["Total Participation"] = df[event_cols].sum(axis=1)
+    df["Total Participation"] = df[event_cols].sum(axis=1) if event_cols else 0
 
     # Lead scoring
     df = compute_lead_score(df, event_cols, metadata_cols)
@@ -158,8 +165,10 @@ if uploaded_file:
     conversion_col = metadata_cols.get("conversion")
     payment_col = metadata_cols.get("payment_date")
 
-    if payment_col:
+    if payment_col and payment_col in df.columns:
         df[payment_col] = safe_to_datetime(df[payment_col])
+    else:
+        payment_col = None
 
     # -----------------------------
     # METRICS
@@ -169,7 +178,7 @@ if uploaded_file:
     active_students = (df["Total Participation"] > 0).sum()
 
     paid_students = 0
-    if conversion_col:
+    if conversion_col and conversion_col in df.columns:
         paid_students = df[conversion_col].astype(str).str.lower().str.contains("paid|admitted", na=False).sum()
 
     conversion_rate = (paid_students / active_students * 100) if active_students > 0 else 0
@@ -189,7 +198,7 @@ if uploaded_file:
     st.header("1️⃣ Top Participating Students")
 
     top_participants = df.sort_values("Total Participation", ascending=False)
-    display_cols = [c for c in [name_col, "Total Participation", conversion_col, "Lead Score"] if c]
+    display_cols = [c for c in [name_col, "Total Participation", conversion_col, "Lead Score"] if c and c in df.columns]
 
     st.dataframe(top_participants[display_cols], use_container_width=True, height=300)
 
@@ -201,7 +210,7 @@ if uploaded_file:
 
     st.header("2️⃣ Payment & Conversion Analysis")
 
-    if conversion_col:
+    if conversion_col and conversion_col in df.columns:
         conv_series = df[conversion_col].astype(str).str.lower()
 
         paid_df = df[conv_series.str.contains("paid|admitted", na=False)]
@@ -228,8 +237,7 @@ if uploaded_file:
 
     st.header("3️⃣ Retention Analysis")
 
-    if payment_col:
-        # Retention = paid + participated after payment date
+    if payment_col and conversion_col and conversion_col in df.columns:
         retention_flags = []
 
         for idx, row in df.iterrows():
@@ -238,13 +246,8 @@ if uploaded_file:
                 retention_flags.append(False)
                 continue
 
-            # Assume event names contain dates or are sequential
-            participated_after = False
-            for col in event_cols:
-                if row[col] == 1:
-                    participated_after = True
-                    break
-
+            # Retained if participated in any event
+            participated_after = row[event_cols].sum() > 0 if event_cols else False
             retention_flags.append(participated_after)
 
         df["Retained"] = retention_flags
@@ -254,11 +257,11 @@ if uploaded_file:
 
         st.metric("Retention Rate", f"{retention_rate:.1f}%")
         st.subheader("Retained Students")
-        display_cols_ret = [c for c in [name_col, conversion_col, payment_col, "Retained"] if c]
+        display_cols_ret = [c for c in [name_col, conversion_col, payment_col, "Retained"] if c and c in df.columns]
         st.dataframe(retained_students[display_cols_ret], use_container_width=True, height=300)
 
     else:
-        st.info("Payment Date column not found — Retention analysis skipped (UG sheet).")
+        st.info("Payment Date or Conversion Status column not found — Retention analysis skipped (UG sheet).")
 
     st.divider()
 
@@ -269,7 +272,7 @@ if uploaded_file:
     st.header("4️⃣ Students With NO Event Participation")
 
     no_participation_df = df[df["Total Participation"] == 0]
-    display_cols_no = [c for c in [name_col, conversion_col, payment_col] if c]
+    display_cols_no = [c for c in [name_col, conversion_col, payment_col] if c and c in df.columns]
 
     st.dataframe(no_participation_df[display_cols_no], use_container_width=True, height=300)
 
@@ -281,7 +284,9 @@ if uploaded_file:
 
     st.header("5️⃣ Paid Students With Low / No Engagement")
 
-    if conversion_col:
+    if conversion_col and conversion_col in df.columns:
+        conv_series = df[conversion_col].astype(str).str.lower()
+        paid_df = df[conv_series.str.contains("paid|admitted", na=False)]
         paid_low_engagement = paid_df[paid_df["Total Participation"] <= 1]
         st.dataframe(paid_low_engagement[display_cols], use_container_width=True, height=300)
     else:
@@ -314,7 +319,7 @@ if uploaded_file:
 
     st.header("7️⃣ Per-Student Participation Timeline")
 
-    if name_col:
+    if name_col and name_col in df.columns and event_cols:
         student_names = df[name_col].dropna().astype(str).unique().tolist()
         selected_student = st.selectbox("Select Student", student_names)
 
@@ -322,11 +327,10 @@ if uploaded_file:
 
         timeline_df = pd.DataFrame({
             "Event": event_cols,
-            "Participation": [student_row[col] for col in event_cols]
+            "Participation": [int(student_row[col]) for col in event_cols]
         })
 
-        # Build line with breaks
-        timeline_df["Participation"] = timeline_df["Participation"].astype(int)
+        # Break lines for non-participation
         timeline_df["PlotValue"] = timeline_df["Participation"].replace({0: np.nan})
 
         fig2 = px.line(timeline_df, x="Event", y="PlotValue", markers=True,
@@ -342,7 +346,7 @@ if uploaded_file:
         st.plotly_chart(fig2, use_container_width=True)
 
     else:
-        st.info("Student Name column not found — Timeline view unavailable.")
+        st.info("Student Name or Event columns not found — Timeline view unavailable.")
 
     st.divider()
 
