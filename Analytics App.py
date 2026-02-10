@@ -353,4 +353,4 @@ if __name__ == "__main__":
         run_streamlit_app()
     else:
         print("Streamlit is not installed. Install it with: pip install streamlit")
-pip install streamlit
+
