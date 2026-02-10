@@ -7,9 +7,34 @@ st.set_page_config(page_title="Engagement Analytics", layout="wide")
 
 
 # ----------------------------- #
-# 🔧 UTILITIES
+# 🔧 HELPERS
 # ----------------------------- #
-def make_columns_unique(cols):
+def normalize_yes_no(series):
+    return (
+        series.astype(str)
+        .str.strip()
+        .str.lower()
+        .replace({
+            "yes": 1, "y": 1, "true": 1, "1": 1,
+            "no": 0, "n": 0, "false": 0, "0": 0,
+            "nan": 0, "none": 0, "": 0
+        })
+        .apply(pd.to_numeric, errors="coerce")
+        .fillna(0)
+        .astype(int)
+    )
+
+
+def find_column(df, keywords):
+    for col in df.columns:
+        col_l = str(col).lower()
+        for kw in keywords:
+            if kw in col_l:
+                return col
+    return None
+
+
+def make_unique_columns(cols):
     seen = {}
     new_cols = []
     for col in cols:
@@ -23,91 +48,46 @@ def make_columns_unique(cols):
     return new_cols
 
 
-def normalize_yes_no(series):
-    return (
-        series.astype(str)
-        .str.strip()
-        .str.lower()
-        .replace({
-            "yes": 1, "y": 1, "true": 1, "1": 1,
-            "no": 0, "n": 0, "false": 0, "0": 0,
-            "nan": 0, "none": 0, "": 0
-        })
-        .apply(pd.to_numeric, errors="coerce")
-        .fillna(0)
-    )
-
-
-def find_column(df, keywords):
-    for col in df.columns:
-        col_l = str(col).lower()
-        for kw in keywords:
-            if kw in col_l:
-                return col
-    return None
-
-
-def is_metadata_column(col):
-    col_l = str(col).lower()
-    metadata_keywords = [
-        "name", "email", "mobile", "phone", "country", "income", "batch",
-        "community", "status", "date", "score", "conversion", "payment",
-        "admitted", "remarks", "notes"
-    ]
-    return any(kw in col_l for kw in metadata_keywords)
-
-
 # ----------------------------- #
-# 📥 LOAD & PARSE SHEET
+# 📥 LOAD SHEET (YOUR FORMAT)
 # ----------------------------- #
 @st.cache_data
 def load_group_sheet(uploaded_file, sheet_name):
     raw = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=None)
 
-    # Detect header row (row containing "Student" or "Name")
-    header_row = None
-    for i in range(min(10, len(raw))):
-        row_str = raw.iloc[i].astype(str).str.lower()
-        if row_str.str.contains("student").any() or row_str.str.contains("name").any():
-            header_row = i
-            break
-
-    if header_row is None:
-        raise ValueError("❌ Could not detect header row.")
+    # Row 0 → Event names
+    # Row 1 → Event dates
+    # Row 2 → Actual column headers
+    event_names = raw.iloc[0].fillna("").astype(str)
+    header_row = 2
 
     headers = raw.iloc[header_row].fillna("").astype(str)
-    headers = make_columns_unique(headers)
+    headers = make_unique_columns(headers)
 
     df = raw.iloc[header_row + 1:].reset_index(drop=True)
     df.columns = headers
 
-    # Drop completely empty columns
-    df = df.dropna(axis=1, how="all")
+    # Drop completely empty rows
+    df = df.dropna(how="all")
 
-    # Detect event columns (Yes/No columns that are NOT metadata)
-    event_cols = []
-    for col in df.columns:
-        try:
-            if is_metadata_column(col):
-                continue
+    # Drop summary numeric rows at bottom
+    df = df[df["Student Name"].astype(str).str.strip().ne("0")]
 
-            series = df[col]
-            if isinstance(series, pd.DataFrame):
-                series = series.iloc[:, 0]
+    # Detect event columns = columns between Comments and first student event column
+    metadata_cols = [
+        "Student Name", "E mail", "Phone Number", "Country", "Income", "Batch",
+        "Data Added to the community", "Community Status", "Date of Exit",
+        "Conversion Status", "Overall Engagement Score", "Conversion Status_1",
+        "Payment Date", "Comments"
+    ]
 
-            sample = series.dropna().astype(str).str.lower()
-            if len(sample) == 0:
-                continue
+    event_cols = [col for col in df.columns if col not in metadata_cols]
 
-            yes_no_ratio = sample.isin(["yes", "no", "y", "n", "1", "0", "true", "false"]).mean()
-            if yes_no_ratio > 0.5:
-                event_cols.append(col)
-        except:
-            continue
+    # Clean event columns
+    for col in event_cols:
+        df[col] = normalize_yes_no(df[col])
 
-    event_meta_df = pd.DataFrame({"Event Column": event_cols, "Event Name": event_cols})
-
-    return df, event_cols, event_meta_df
+    return df, event_cols, event_names[event_names != ""].tolist()
 
 
 # ----------------------------- #
@@ -115,40 +95,22 @@ def load_group_sheet(uploaded_file, sheet_name):
 # ----------------------------- #
 def student_participation_analysis(df, event_cols):
     df = df.copy()
-
-    if not event_cols:
-        df["Total Participation"] = 0
-        return df, pd.DataFrame(), {}
-
-    for col in event_cols:
-        series = df[col]
-        if isinstance(series, pd.DataFrame):
-            series = series.iloc[:, 0]
-        df[col] = normalize_yes_no(series)
-
     df["Total Participation"] = df[event_cols].sum(axis=1)
 
     event_participation = df[event_cols].sum().reset_index()
     event_participation.columns = ["Event", "Participants"]
 
-    participants = {}
-    for col in event_cols:
-        participants[col] = df.loc[df[col] == 1, "Student Name"].tolist() if "Student Name" in df.columns else []
-
-    return df, event_participation, participants
+    return df, event_participation
 
 
 # ----------------------------- #
 # 💰 CONVERSION & RETENTION
 # ----------------------------- #
-def conversion_and_retention_analysis(df, event_cols, payment_date_col, conversion_col):
+def conversion_and_retention_analysis(df, conversion_col, payment_date_col):
     df = df.copy()
 
     if conversion_col:
-        conv_series = df[conversion_col]
-        if isinstance(conv_series, pd.DataFrame):
-            conv_series = conv_series.iloc[:, 0]
-        df["Conversion Status Clean"] = conv_series.astype(str).str.strip()
+        df["Conversion Status Clean"] = df[conversion_col].astype(str).str.strip()
     else:
         df["Conversion Status Clean"] = ""
 
@@ -169,10 +131,7 @@ def conversion_and_retention_analysis(df, event_cols, payment_date_col, conversi
     if payment_date_col:
         for _, row in paid_students.iterrows():
             payment_date = pd.to_datetime(row.get(payment_date_col), errors="coerce")
-            if pd.isna(payment_date):
-                continue
-
-            if row["Total Participation"] > 0:
+            if not pd.isna(payment_date) and row["Total Participation"] > 0:
                 retained_students.append(row["Student Name"])
 
         retention_rate = (len(retained_students) / len(paid_students) * 100) if len(paid_students) > 0 else 0
@@ -190,15 +149,17 @@ def conversion_and_retention_analysis(df, event_cols, payment_date_col, conversi
 # ----------------------------- #
 # 📈 STUDENT TIMELINE
 # ----------------------------- #
-def plot_student_timeline(df, event_cols, student_name, payment_date_col):
+def plot_student_timeline(df, event_cols, event_names, student_name, payment_date_col):
     row = df[df["Student Name"] == student_name].iloc[0]
 
     x = list(range(1, len(event_cols) + 1))
-    y = [row[col] if col in df.columns else 0 for col in event_cols]
+    y = [row[col] for col in event_cols]
+
+    labels = event_names[:len(event_cols)]
 
     plt.figure(figsize=(12, 4))
-    plt.plot(x, y, marker="o", linestyle="-")
-    plt.xticks(x, event_cols, rotation=45, ha="right")
+    plt.plot(x, y, marker="o")
+    plt.xticks(x, labels, rotation=45, ha="right")
     plt.ylabel("Participation (1 = Yes, 0 = No)")
     plt.title(f"Participation Timeline: {student_name}")
     plt.grid(True)
@@ -207,7 +168,7 @@ def plot_student_timeline(df, event_cols, student_name, payment_date_col):
         payment_val = row.get(payment_date_col)
         payment_date = pd.to_datetime(payment_val, errors="coerce")
         if not pd.isna(payment_date):
-            plt.scatter(x[-1], 1, marker="v", color="green", s=140)
+            plt.scatter(x[-1], 1, marker="v", color="green", s=150)
             plt.text(x[-1], 1.1, "✔ Paid", color="green", ha="center")
 
     st.pyplot(plt)
@@ -227,30 +188,25 @@ def run_streamlit_app():
     xls = pd.ExcelFile(uploaded_file)
     sheet_name = st.selectbox("Select Sheet / Group", xls.sheet_names)
 
-    df, event_cols, event_meta_df = load_group_sheet(uploaded_file, sheet_name)
-    df, event_participation, participants = student_participation_analysis(df, event_cols)
+    df, event_cols, event_names = load_group_sheet(uploaded_file, sheet_name)
+    df, event_participation = student_participation_analysis(df, event_cols)
 
-    # Detect key columns
-    conversion_col = find_column(df, ["conversion status", "conversion", "payment status"])
-    payment_date_col = find_column(df, ["payment date", "date of payment", "paid on"])
-    community_col = find_column(df, ["community status", "community"])
+    conversion_col = find_column(df, ["conversion status"])
+    payment_date_col = find_column(df, ["payment date"])
 
-    conv_metrics = conversion_and_retention_analysis(df, event_cols, payment_date_col, conversion_col)
+    conv_metrics = conversion_and_retention_analysis(df, conversion_col, payment_date_col)
 
     # ----------------------------- #
     # 🏆 TOP PARTICIPATING STUDENTS
     # ----------------------------- #
     st.subheader("🏆 Top Participating Students")
 
-    if "Student Name" in df.columns:
-        cols = ["Student Name", "Total Participation"]
-        if conversion_col:
-            cols.append(conversion_col)
+    cols = ["Student Name", "Total Participation"]
+    if conversion_col:
+        cols.append(conversion_col)
 
-        top_students = df.sort_values("Total Participation", ascending=False)[cols].head(20)
-        st.dataframe(top_students, use_container_width=True)
-    else:
-        st.warning("Student Name column not found.")
+    top_students = df.sort_values("Total Participation", ascending=False)[cols].head(25)
+    st.dataframe(top_students, use_container_width=True)
 
     # ----------------------------- #
     # 💰 PAYMENT & CONVERSION
@@ -294,12 +250,13 @@ def run_streamlit_app():
     st.subheader("❌ Students With NO Event Participation")
 
     no_participants = df[df["Total Participation"] == 0]
+    cols = ["Student Name"]
+    if conversion_col:
+        cols.append(conversion_col)
+    if payment_date_col:
+        cols.append(payment_date_col)
+
     if not no_participants.empty:
-        cols = ["Student Name"]
-        if conversion_col:
-            cols.append(conversion_col)
-        if payment_date_col:
-            cols.append(payment_date_col)
         st.dataframe(no_participants[cols], use_container_width=True)
     else:
         st.success("🎉 All students have participated in at least one event.")
@@ -313,10 +270,11 @@ def run_streamlit_app():
         conv_metrics["paid_students"]["Total Participation"] <= 1
     ]
 
+    cols = ["Student Name", "Total Participation"]
+    if payment_date_col:
+        cols.append(payment_date_col)
+
     if not low_engagement_paid.empty:
-        cols = ["Student Name", "Total Participation"]
-        if payment_date_col:
-            cols.append(payment_date_col)
         st.dataframe(low_engagement_paid[cols], use_container_width=True)
     else:
         st.success("👏 No paid students with low engagement!")
@@ -341,16 +299,13 @@ def run_streamlit_app():
     # ----------------------------- #
     st.subheader("📈 Per-Student Participation Timeline")
 
-    if "Student Name" in df.columns and event_cols:
-        student_choice = st.selectbox("Select Student", df["Student Name"].dropna().unique())
-        plot_student_timeline(df, event_cols, student_choice, payment_date_col)
-    else:
-        st.info("Timeline not available for this sheet.")
+    student_choice = st.selectbox("Select Student", df["Student Name"].dropna().unique())
+    plot_student_timeline(df, event_cols, event_names, student_choice, payment_date_col)
 
     # ----------------------------- #
     # 📋 RAW DATA VIEW
     # ----------------------------- #
-    with st.expander("📋 View Processed Data"):
+    with st.expander("📋 View Cleaned Data"):
         st.dataframe(df, use_container_width=True)
 
 
