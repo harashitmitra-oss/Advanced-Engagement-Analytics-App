@@ -6,9 +6,9 @@ import re
 
 st.set_page_config(page_title="Engagement Analytics Dashboard", layout="wide")
 
-# --------------------------------
-# Helper Functions
-# --------------------------------
+# --------------------------------------------------
+# Utility Functions
+# --------------------------------------------------
 
 def normalize_binary(x):
     if pd.isna(x):
@@ -18,7 +18,7 @@ def normalize_binary(x):
         return 1
     return 0
 
-def clean_columns(cols):
+def clean_cols(cols):
     return (
         pd.Series(cols)
         .astype(str)
@@ -28,64 +28,24 @@ def clean_columns(cols):
         .str.strip()
     )
 
-def find_header_row(df):
-    for i in range(len(df)):
-        row = df.iloc[i].astype(str).str.lower()
-        if row.str.contains("student name").any():
-            return i
-    return None
-
-def find_event_row(df, header_row):
-    # Event row is usually above header row (PG) or same row (UG)
-    for i in range(header_row):
-        row = df.iloc[i]
-        non_null = row.notna().sum()
-        if non_null > 5:
-            return i
-    return None
-
-def detect_metadata_columns(columns):
-    meta = {}
-    for col in columns:
-        cl = col.lower()
-        if "student" in cl and "name" in cl:
-            meta["name"] = col
-        elif "email" in cl:
-            meta["email"] = col
-        elif "country" in cl:
-            meta["country"] = col
-        elif "batch" in cl:
-            meta["batch"] = col
-        elif "conversion" in cl:
-            meta["conversion"] = col
-        elif "payment" in cl and "date" in cl:
-            meta["payment_date"] = col
-        elif "overall engagement" in cl or "engagement score" in cl:
-            meta["engagement_score"] = col
-    return meta
-
-def extract_event_names(row):
-    events = []
-    for val in row:
-        if pd.isna(val):
-            continue
-        v = str(val).strip()
-        if v == "":
-            continue
-        if re.search(r"(total|summary|overall|score)", v.lower()):
-            continue
-        events.append(v)
-    return events
-
 def parse_date_safe(x):
     try:
         return pd.to_datetime(x)
     except:
         return pd.NaT
 
-# --------------------------------
+def detect_sheet_type(sheet_name):
+    name = sheet_name.lower()
+    if "pg engagement tracker b2" in name:
+        return "PG_B2"
+    elif "pg engagement tracker b3" in name:
+        return "PG_B3"
+    else:
+        return "UG"
+
+# --------------------------------------------------
 # Load File
-# --------------------------------
+# --------------------------------------------------
 
 uploaded_file = st.file_uploader("Upload Master Engagement Tracker Excel File", type=["xlsx"])
 
@@ -99,61 +59,78 @@ sheet_names = xls.sheet_names
 st.sidebar.header("Sheet Selector")
 selected_sheet = st.sidebar.selectbox("Select a sheet", sheet_names)
 
-raw_df = pd.read_excel(uploaded_file, sheet_name=selected_sheet, header=None)
+raw = pd.read_excel(uploaded_file, sheet_name=selected_sheet, header=None)
 
-# --------------------------------
-# Detect Header & Event Rows
-# --------------------------------
+sheet_type = detect_sheet_type(selected_sheet)
 
-header_row = find_header_row(raw_df)
-if header_row is None:
-    st.error("Could not detect header row (Student Name).")
-    st.stop()
+# --------------------------------------------------
+# Sheet-Specific Parsing
+# --------------------------------------------------
 
-event_row = find_event_row(raw_df, header_row)
+if sheet_type == "PG_B2":
+    event_row = 0
+    header_row = 2
+    data_start_row = 3
+elif sheet_type == "PG_B3":
+    event_row = 1   # Row 2 in Excel
+    header_row = 3  # Row 4 in Excel
+    data_start_row = 4
+else:  # UG
+    event_row = 0
+    header_row = 2
+    data_start_row = 3
 
-# --------------------------------
-# Build Main DataFrame
-# --------------------------------
+# Extract headers
+headers_main = raw.iloc[header_row, :].astype(str)
+headers_main = clean_cols(headers_main)
 
-headers = clean_columns(raw_df.iloc[header_row])
-df = raw_df.iloc[header_row + 1:].copy()
-df.columns = headers
+event_headers = raw.iloc[event_row, :].astype(str)
+event_headers = clean_cols(event_headers)
+
+df = raw.iloc[data_start_row:].copy()
+df.columns = headers_main
 df.reset_index(drop=True, inplace=True)
 
-# Remove fully empty rows
+# Drop fully empty rows
 df = df.dropna(how="all")
 
-# --------------------------------
+# --------------------------------------------------
 # Detect Metadata Columns
-# --------------------------------
+# --------------------------------------------------
 
-meta_cols = detect_metadata_columns(df.columns)
+cols_lower = df.columns.str.lower()
 
-name_col = meta_cols.get("name")
-conversion_col = meta_cols.get("conversion")
-payment_col = meta_cols.get("payment_date")
-engagement_score_col = meta_cols.get("engagement_score")
+def find_col(keyword_list):
+    for kw in keyword_list:
+        matches = df.columns[cols_lower.str.contains(kw)]
+        if len(matches) > 0:
+            return matches[0]
+    return None
 
-if not name_col:
-    st.error("Student Name column not detected.")
+name_col = find_col(["student name"])
+conversion_col = find_col(["conversion"])
+payment_col = find_col(["payment date"])
+engagement_score_col = find_col(["engagement"])
+
+if name_col is None:
+    st.error("❌ Student Name column not found. Please check sheet format.")
     st.stop()
 
-# --------------------------------
-# Detect Event Columns
-# --------------------------------
+# --------------------------------------------------
+# Detect Event Columns (from event row, skipping blanks)
+# --------------------------------------------------
 
 event_columns = []
+for col_idx, val in enumerate(event_headers):
+    if pd.isna(val):
+        continue
+    v = str(val).strip()
+    if v == "" or re.search(r"(total|summary|overall|score)", v.lower()):
+        continue
+    col_name = df.columns[col_idx]
+    event_columns.append(col_name)
 
-if event_row is not None:
-    event_row_values = raw_df.iloc[event_row]
-    event_names = extract_event_names(event_row_values)
-
-    for col in df.columns:
-        if str(col).strip() in event_names:
-            event_columns.append(col)
-
-# Fallback: detect event columns by keywords
+# Fallback if empty
 if not event_columns:
     event_columns = df.columns[df.columns.str.contains(
         "session|workshop|hackathon|ama|class|bootcamp|event", case=False, na=False
@@ -163,32 +140,32 @@ if not event_columns:
 for col in event_columns:
     df[col] = df[col].apply(normalize_binary)
 
-# --------------------------------
+# --------------------------------------------------
 # Participation Count
-# --------------------------------
+# --------------------------------------------------
 
 df["participation_count"] = df[event_columns].sum(axis=1)
 
-# --------------------------------
+# --------------------------------------------------
 # Payment Date Processing
-# --------------------------------
+# --------------------------------------------------
 
 if payment_col:
     df[payment_col] = df[payment_col].apply(parse_date_safe)
 
-# --------------------------------
-# Conversion Status Processing
-# --------------------------------
+# --------------------------------------------------
+# Conversion Category Logic (FIXED)
+# --------------------------------------------------
 
 def categorize_conversion(row):
     conv = str(row.get(conversion_col, "")).strip().lower() if conversion_col else ""
     payment = row.get(payment_col) if payment_col else None
 
-    # PG logic: Payment date present = Paid
+    # PG logic: payment date exists = Paid
     if payment_col and pd.notna(payment):
         return "Paid / Admitted"
 
-    # UG logic: Conversion status = admitted = Paid
+    # UG logic: conversion status admitted = Paid
     if "admitted" in conv or "paid" in conv:
         return "Paid / Admitted"
     elif "will" in conv:
@@ -198,9 +175,9 @@ def categorize_conversion(row):
 
 df["conversion_category"] = df.apply(categorize_conversion, axis=1)
 
-# --------------------------------
+# --------------------------------------------------
 # Retention Logic (PG Only)
-# --------------------------------
+# --------------------------------------------------
 
 if payment_col:
     df["retained"] = df.apply(
@@ -212,9 +189,9 @@ else:
     df["retained"] = np.nan
     retention_rate = None
 
-# --------------------------------
+# --------------------------------------------------
 # Lead Scoring
-# --------------------------------
+# --------------------------------------------------
 
 def calculate_lead_score(row):
     score = row["participation_count"] * 10
@@ -241,15 +218,15 @@ def calculate_lead_score(row):
 
 df["lead_score"] = df.apply(calculate_lead_score, axis=1)
 
-# --------------------------------
-# Dashboard Layout
-# --------------------------------
+# --------------------------------------------------
+# DASHBOARD
+# --------------------------------------------------
 
 st.title("📊 Engagement Analytics Dashboard")
 
-# --------------------------------
+# -------------------------------
 # Top Metrics
-# --------------------------------
+# -------------------------------
 
 paid_count = (df["conversion_category"] == "Paid / Admitted").sum()
 will_pay_count = (df["conversion_category"] == "Will Pay").sum()
@@ -263,9 +240,9 @@ col2.metric("Will Pay", will_pay_count)
 col3.metric("Not Paid", not_paid_count)
 col4.metric("Conversion Rate", f"{conversion_rate:.2f}%")
 
-# --------------------------------
+# -------------------------------
 # 1️⃣ Top Participating Students
-# --------------------------------
+# -------------------------------
 
 st.header("1️⃣ Top Participating Students")
 
@@ -275,9 +252,9 @@ top_participants = df.sort_values("participation_count", ascending=False)[
 
 st.dataframe(top_participants.head(50), use_container_width=True)
 
-# --------------------------------
+# -------------------------------
 # 2️⃣ Payment & Conversion Analysis
-# --------------------------------
+# -------------------------------
 
 st.header("2️⃣ Payment & Conversion Analysis")
 
@@ -297,9 +274,9 @@ st.dataframe(will_pay_df[[name_col, "conversion_category"]], use_container_width
 st.subheader("🔴 Not Paid")
 st.dataframe(not_paid_df[[name_col, "conversion_category"]], use_container_width=True)
 
-# --------------------------------
+# -------------------------------
 # 3️⃣ Retention Analysis
-# --------------------------------
+# -------------------------------
 
 st.header("3️⃣ Retention Analysis")
 
@@ -311,9 +288,9 @@ if payment_col:
 else:
     st.info("Retention analysis not available for this sheet (no Payment Date column).")
 
-# --------------------------------
+# -------------------------------
 # 4️⃣ Students With NO Event Participation
-# --------------------------------
+# -------------------------------
 
 st.header("4️⃣ Students With NO Event Participation")
 
@@ -324,9 +301,9 @@ if payment_col:
 
 st.dataframe(no_participants[cols_to_show], use_container_width=True)
 
-# --------------------------------
+# -------------------------------
 # 5️⃣ Paid Students With Low / No Engagement
-# --------------------------------
+# -------------------------------
 
 st.header("5️⃣ Paid Students With Low / No Engagement")
 
@@ -344,9 +321,9 @@ if not low_engaged_paid.empty:
 else:
     st.success("No low-engagement paid students found.")
 
-# --------------------------------
+# -------------------------------
 # 6️⃣ Event-wise Participation
-# --------------------------------
+# -------------------------------
 
 st.header("6️⃣ Event-wise Participation")
 
@@ -376,9 +353,9 @@ event_table = pd.DataFrame({
 })
 st.dataframe(event_table, use_container_width=True)
 
-# --------------------------------
+# -------------------------------
 # 7️⃣ Per-Student Participation Timeline
-# --------------------------------
+# -------------------------------
 
 st.header("7️⃣ Per-Student Participation Timeline")
 
@@ -420,9 +397,9 @@ ax2.set_xticklabels(timeline_df["event"], rotation=45, ha="right")
 ax2.legend()
 st.pyplot(fig2)
 
-# --------------------------------
+# -------------------------------
 # Lead Score Leaderboard
-# --------------------------------
+# -------------------------------
 
 st.header("🏆 Lead Score Leaderboard")
 
