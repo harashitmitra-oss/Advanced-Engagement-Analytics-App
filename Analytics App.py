@@ -28,11 +28,6 @@ def clean_column_names(cols):
     return [str(c).strip() for c in cols]
 
 def categorize_conversion(row, conversion_col, payment_col):
-    # Paid logic:
-    # - If Payment Date exists → Paid / Admitted
-    # - Else if Conversion Status contains "admitted" → Paid / Admitted
-    # - Else if contains "will" → Will Pay
-    # - Else → Not Paid
     payment_date = row.get(payment_col, pd.NaT) if payment_col else pd.NaT
     conversion_val = str(row.get(conversion_col, "")).lower().strip() if conversion_col else ""
 
@@ -61,35 +56,9 @@ sheet_names = xls.sheet_names
 st.sidebar.header("Sheet Selector")
 selected_sheet = st.sidebar.selectbox("Select a sheet", sheet_names)
 
-raw_df = pd.read_excel(uploaded_file, sheet_name=selected_sheet, header=None)
+df = pd.read_excel(uploaded_file, sheet_name=selected_sheet)
 
-# ----------------------------------------
-# SHEET-SPECIFIC STRUCTURE LOGIC
-# ----------------------------------------
-
-# Define structure per sheet (YOU CAN ADJUST ROW NUMBERS IF NEEDED)
-SHEET_CONFIG = {
-    "PG Engagement Tracker B2": {"header_row": 2, "event_row": 0},
-    "PG Engagement Tracker B3": {"header_row": 2, "event_row": 1},
-    "UG Engagement Tracker": {"header_row": 2, "event_row": 0},
-    # Fallback default
-    "default": {"header_row": 2, "event_row": 0}
-}
-
-config = SHEET_CONFIG.get(selected_sheet, SHEET_CONFIG["default"])
-header_row = config["header_row"]
-event_row = config["event_row"]
-
-# ----------------------------------------
-# Build DataFrame
-# ----------------------------------------
-
-headers = raw_df.iloc[header_row].astype(str)
-df = raw_df.iloc[header_row + 1:].copy()
-df.columns = clean_column_names(headers)
-df.reset_index(drop=True, inplace=True)
-
-# Remove fully empty rows
+df.columns = clean_column_names(df.columns)
 df = df.dropna(how="all")
 
 # ----------------------------------------
@@ -128,24 +97,14 @@ if not name_col:
     st.stop()
 
 # ----------------------------------------
-# Detect Event Columns
+# Detect Event Columns (FIXED LOGIC)
 # ----------------------------------------
 
-event_row_values = raw_df.iloc[event_row]
-
-event_names = []
-for val in event_row_values:
-    if pd.isna(val):
-        continue
-    v = str(val).strip()
-    if v == "" or re.search(r"(total|summary)", v.lower()):
-        continue
-    event_names.append(v)
-
-event_columns = [col for col in df.columns if str(col) in event_names]
+metadata_cols = set(meta_cols.values())
+event_columns = [col for col in df.columns if col not in metadata_cols]
 
 if not event_columns:
-    st.error("❌ No event columns detected. Please verify event row format.")
+    st.error("❌ No event columns detected. Please verify sheet format.")
     st.stop()
 
 # Normalize event columns
