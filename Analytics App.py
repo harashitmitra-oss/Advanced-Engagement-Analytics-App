@@ -97,25 +97,44 @@ def load_group_sheet(file, sheet_name, event_header_row=0, date_header_row=1, ma
 # -----------------------------
 
 def student_participation_analysis(df, event_cols, event_meta_df):
-    df[event_cols] = df[event_cols].apply(normalize_yes_no)
+    """
+    Computes:
+    1. Student-wise participation count
+    2. Event-wise participation count
+    3. Detailed participant mapping
+    """
 
-    long_df = df.melt(
-        id_vars=["Student Name", "Phone Number"],
-        value_vars=event_cols,
-        var_name="Column",
-        value_name="Participated",
-    )
+    df = df.copy()
 
-    long_df = long_df.merge(event_meta_df, on="Column", how="left")
-    participants = long_df[long_df["Participated"] == 1]
+    # Ensure event_cols exists in df
+    event_cols = [col for col in event_cols if col in df.columns]
 
-    student_participation = (
-        participants.groupby("Student Name")["Event"].count().reset_index(name="Events Attended")
-    )
+    # Normalize Yes/No columns safely (column-wise)
+    df.loc[:, event_cols] = df[event_cols].apply(normalize_yes_no, axis=0)
 
+    # Student participation count
+    df["Total Events Participated"] = df[event_cols].sum(axis=1)
+    student_participation = df[["Student Name", "Total Events Participated"]]
+
+    # Event participation count
     event_participation = (
-        participants.groupby("Event")["Student Name"].nunique().reset_index(name="Participants")
+        df[event_cols]
+        .sum()
+        .reset_index()
+        .rename(columns={"index": "Column", 0: "Participants"})
+        .merge(event_meta_df, on="Column", how="left")
     )
+
+    # Participant mapping
+    participants = []
+    for col in event_cols:
+        participating_students = df.loc[df[col] == 1, "Student Name"].tolist()
+        participants.append({
+            "Column": col,
+            "Participants": participating_students
+        })
+
+    participants = pd.DataFrame(participants).merge(event_meta_df, on="Column", how="left")
 
     return student_participation, event_participation, participants
 
