@@ -2,12 +2,13 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import re
 
 st.set_page_config(page_title="Engagement Analytics Dashboard", layout="wide")
 
-# ===============================
+# ============================
 # FILE UPLOAD
-# ===============================
+# ============================
 
 uploaded_file = st.file_uploader("Upload Master Engagement Tracker Excel File", type=["xlsx"])
 if not uploaded_file:
@@ -21,56 +22,83 @@ selected_sheet = st.sidebar.selectbox("Select a sheet", sheet_names)
 
 raw = pd.read_excel(uploaded_file, sheet_name=selected_sheet, header=None)
 
-# ===============================
-# HEADER ROW DETECTION
-# ===============================
+# ============================
+# HELPER FUNCTIONS
+# ============================
 
-def detect_header_row(df):
+def normalize_binary(x):
+    if pd.isna(x):
+        return 0
+    try:
+        x = str(x).strip().lower()
+        if x in ["yes", "y", "true", "1", "attended", "present"]:
+            return 1
+        return 0
+    except:
+        return 0
+
+def parse_date_safe(x):
+    try:
+        return pd.to_datetime(x)
+    except:
+        return pd.NaT
+
+def find_header_row(df):
     for i in range(len(df)):
         row = df.iloc[i].astype(str).str.lower()
-        if (
-            row.str.contains("name").any()
-            or row.str.contains("student").any()
-            or row.str.contains("email").any()
-            or row.str.contains("mobile").any()
-        ):
+        if row.str.contains("student").any() or row.str.contains("name").any():
             return i
     return None
 
-header_row = detect_header_row(raw)
+def find_event_row(df):
+    for i in range(len(df)):
+        row = df.iloc[i]
+        non_null = row.notna().sum()
+        if non_null > 8:
+            return i
+    return None
+
+def make_unique(cols):
+    seen = {}
+    new_cols = []
+    for col in cols:
+        if col not in seen:
+            seen[col] = 0
+            new_cols.append(col)
+        else:
+            seen[col] += 1
+            new_cols.append(f"{col}_{seen[col]}")
+    return new_cols
+
+# ============================
+# HEADER & DATAFRAME BUILD
+# ============================
+
+header_row = find_header_row(raw)
+event_row = find_event_row(raw)
+
 if header_row is None:
-    st.error("❌ Could not detect header row. Please ensure a row contains student identifiers (Name, Email, Mobile).")
+    st.error("❌ Could not detect header row. Ensure Student Name / Email exists.")
     st.stop()
 
-# ===============================
-# BUILD DATAFRAME
-# ===============================
-
 headers = raw.iloc[header_row].astype(str).fillna("")
+headers = headers.str.replace("\n", " ", regex=True).str.replace("\r", " ", regex=True).str.strip()
+headers = make_unique(headers.tolist())
+
 df = raw.iloc[header_row + 1:].copy()
 df.columns = headers
 df = df.dropna(how="all").reset_index(drop=True)
 
-# Clean column names
-df.columns = (
-    df.columns.astype(str)
-    .str.replace("\n", " ", regex=True)
-    .str.replace("\r", " ", regex=True)
-    .str.replace("\u00a0", " ", regex=True)
-    .str.strip()
-)
+# Remove numeric-only rows
+df = df[~df.apply(lambda r: r.astype(str).str.fullmatch(r"\d+(\.\d+)?").all(), axis=1)]
 
-# Remove duplicate columns safely
-df = df.loc[:, ~df.columns.duplicated()]
-
-# ===============================
+# ============================
 # COLUMN DETECTION
-# ===============================
+# ============================
 
 def find_col(columns, keywords):
     for col in columns:
-        cl = str(col).lower()
-        if any(k in cl for k in keywords):
+        if any(k in col.lower() for k in keywords):
             return col
     return None
 
@@ -84,9 +112,9 @@ if not name_col:
     st.error("❌ Student Name column not detected.")
     st.stop()
 
-# ===============================
+# ============================
 # EVENT COLUMN DETECTION
-# ===============================
+# ============================
 
 metadata_cols = {c for c in [name_col, email_col, mobile_col, conversion_col, payment_col] if c}
 event_columns = [col for col in df.columns if col not in metadata_cols]
@@ -95,40 +123,20 @@ if not event_columns:
     st.error("❌ No event columns detected. Please verify event row format.")
     st.stop()
 
-# ===============================
-# SAFE BINARY NORMALIZATION
-# ===============================
-
-def normalize_binary(x):
-    try:
-        if pd.isna(x):
-            return 0
-        x = str(x).strip().lower()
-        if x in ["yes", "y", "true", "1", "attended", "present"]:
-            return 1
-        return 0
-    except:
-        return 0
-
+# Normalize event columns
 for col in event_columns:
     df[col] = df[col].apply(normalize_binary)
 
-# ===============================
-# PAYMENT DATE PARSING
-# ===============================
-
-def parse_date_safe(x):
-    try:
-        return pd.to_datetime(x)
-    except:
-        return pd.NaT
+# ============================
+# PAYMENT DATE
+# ============================
 
 if payment_col:
     df[payment_col] = df[payment_col].apply(parse_date_safe)
 
-# ===============================
+# ============================
 # CONVERSION LOGIC
-# ===============================
+# ============================
 
 if not conversion_col:
     df["Conversion Status"] = ""
@@ -136,7 +144,7 @@ if not conversion_col:
 
 df[conversion_col] = df[conversion_col].astype(str).str.strip().str.lower()
 
-def categorize_conversion(row):
+def conversion_category(row):
     if payment_col and pd.notna(row[payment_col]):
         return "Paid / Admitted"
     val = row[conversion_col]
@@ -147,17 +155,17 @@ def categorize_conversion(row):
     else:
         return "Not Paid"
 
-df["conversion_category"] = df.apply(categorize_conversion, axis=1)
+df["conversion_category"] = df.apply(conversion_category, axis=1)
 
-# ===============================
+# ============================
 # PARTICIPATION COUNT
-# ===============================
+# ============================
 
 df["participation_count"] = df[event_columns].sum(axis=1)
 
-# ===============================
-# RETENTION
-# ===============================
+# ============================
+# RETENTION LOGIC
+# ============================
 
 if payment_col:
     df["retained"] = df.apply(
@@ -169,9 +177,9 @@ else:
     df["retained"] = np.nan
     retention_rate = None
 
-# ===============================
-# LEAD SCORING
-# ===============================
+# ============================
+# LEAD SCORE
+# ============================
 
 def calculate_lead_score(row):
     score = row["participation_count"] * 10
@@ -194,9 +202,9 @@ def calculate_lead_score(row):
 
 df["lead_score"] = df.apply(calculate_lead_score, axis=1)
 
-# ===============================
+# ============================
 # DASHBOARD
-# ===============================
+# ============================
 
 st.title("📊 Engagement Analytics Dashboard")
 
@@ -212,9 +220,9 @@ col2.metric("Will Pay", will_pay_count)
 col3.metric("Not Paid", not_paid_count)
 col4.metric("Conversion Rate", f"{conversion_rate:.2f}%")
 
-# -------------------------------
+# ============================
 # 1️⃣ TOP PARTICIPANTS
-# -------------------------------
+# ============================
 
 st.header("1️⃣ Top Participating Students")
 st.dataframe(
@@ -224,9 +232,9 @@ st.dataframe(
     use_container_width=True
 )
 
-# -------------------------------
+# ============================
 # 2️⃣ PAYMENT & CONVERSION
-# -------------------------------
+# ============================
 
 st.header("2️⃣ Payment & Conversion Analysis")
 
@@ -246,9 +254,9 @@ st.dataframe(will_pay_df[[name_col, conversion_col]], use_container_width=True)
 st.subheader("🔴 Not Paid")
 st.dataframe(not_paid_df[[name_col, conversion_col]], use_container_width=True)
 
-# -------------------------------
+# ============================
 # 3️⃣ RETENTION
-# -------------------------------
+# ============================
 
 st.header("3️⃣ Retention Analysis")
 
@@ -261,9 +269,9 @@ if payment_col:
 else:
     st.info("Retention analysis not available for this sheet (no Payment Date column).")
 
-# -------------------------------
+# ============================
 # 4️⃣ NO PARTICIPATION
-# -------------------------------
+# ============================
 
 st.header("4️⃣ Students With NO Event Participation")
 cols_np = [name_col, conversion_col]
@@ -271,9 +279,9 @@ if payment_col:
     cols_np.append(payment_col)
 st.dataframe(df[df["participation_count"] == 0][cols_np], use_container_width=True)
 
-# -------------------------------
+# ============================
 # 5️⃣ LOW ENGAGEMENT PAID
-# -------------------------------
+# ============================
 
 st.header("5️⃣ Paid Students With Low / No Engagement")
 low_engaged_paid = df[
@@ -290,9 +298,9 @@ if not low_engaged_paid.empty:
 else:
     st.success("No low-engagement paid students found.")
 
-# -------------------------------
+# ============================
 # 6️⃣ EVENT-WISE PARTICIPATION
-# -------------------------------
+# ============================
 
 st.header("6️⃣ Event-wise Participation")
 
@@ -320,9 +328,9 @@ ax_pie.pie(event_participation, labels=event_participation.index, autopct="%1.1f
 ax_pie.set_title("Event Participation Distribution")
 st.pyplot(fig_pie)
 
-# -------------------------------
+# ============================
 # 7️⃣ PER-STUDENT TIMELINE
-# -------------------------------
+# ============================
 
 st.header("7️⃣ Per-Student Participation Timeline")
 
@@ -356,9 +364,9 @@ ax2.set_xticklabels(timeline_df["event"], rotation=45, ha="right")
 ax2.legend()
 st.pyplot(fig2)
 
-# -------------------------------
+# ============================
 # 8️⃣ LEAD SCORE LEADERBOARD
-# -------------------------------
+# ============================
 
 st.header("🏆 Lead Score Leaderboard")
 st.dataframe(
@@ -368,9 +376,9 @@ st.dataframe(
     use_container_width=True
 )
 
-# -------------------------------
+# ============================
 # 9️⃣ CONVERSION STATUS BREAKDOWN
-# -------------------------------
+# ============================
 
 st.header("9️⃣ Conversion Status Category Breakdown")
 conversion_summary = df["conversion_category"].value_counts().reset_index()
