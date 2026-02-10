@@ -21,24 +21,27 @@ def normalize_binary(x):
 def find_header_row(df):
     for i in range(len(df)):
         row = df.iloc[i].astype(str).str.lower()
-        if row.str.contains("student").any():
+        if row.str.contains("student name").any():
             return i
     return None
 
 def find_event_row(df):
-    # First row that contains multiple non-null and non-metadata values
+    # Row that contains most non-null text values and looks like event headers
+    max_non_null = 0
+    event_row = None
     for i in range(len(df)):
         row = df.iloc[i]
         non_null = row.notna().sum()
-        if non_null > 5:
-            return i
-    return None
+        if non_null > max_non_null:
+            max_non_null = non_null
+            event_row = i
+    return event_row
 
 def detect_metadata_columns(columns):
     meta = {}
     for col in columns:
         cl = col.lower()
-        if "name" in cl:
+        if "student name" in cl:
             meta["name"] = col
         elif "email" in cl:
             meta["email"] = col
@@ -141,7 +144,11 @@ if not name_col:
 event_row_values = raw_df.iloc[event_row]
 event_names = extract_events(event_row_values)
 
-event_columns = [col for col in df.columns if str(col) in event_names]
+event_columns = [col for col in df.columns if str(col).strip() in event_names]
+
+if not event_columns:
+    st.error("No event columns detected.")
+    st.stop()
 
 # Normalize event columns
 for col in event_columns:
@@ -157,8 +164,35 @@ else:
     df["conversion_status_temp"] = "not paid"
     conversion_col = "conversion_status_temp"
 
+# -------------------------------
+# Payment Date Processing
+# -------------------------------
+
+if payment_col:
+    df[payment_col] = df[payment_col].apply(parse_date_safe)
+
+# -------------------------------
+# Paid Logic (YOUR RULE)
+# -------------------------------
+# Paid if:
+# 1. Conversion Status contains "admitted", OR
+# 2. Payment Date exists (PG)
+
+def is_paid(row):
+    if conversion_col and "admitted" in str(row[conversion_col]).lower():
+        return True
+    if payment_col and pd.notna(row[payment_col]):
+        return True
+    return False
+
+df["paid_flag"] = df.apply(is_paid, axis=1)
+
+# -------------------------------
+# Conversion Category (for display)
+# -------------------------------
+
 def categorize_conversion(x):
-    if "admitted" in x or "paid" in x:
+    if "admitted" in x:
         return "Paid / Admitted"
     elif "will" in x:
         return "Will Pay"
@@ -166,13 +200,6 @@ def categorize_conversion(x):
         return "Not Paid"
 
 df["conversion_category"] = df[conversion_col].apply(categorize_conversion)
-
-# -------------------------------
-# Payment Date Processing
-# -------------------------------
-
-if payment_col:
-    df[payment_col] = df[payment_col].apply(parse_date_safe)
 
 # -------------------------------
 # Participation Count
@@ -211,7 +238,7 @@ def calculate_lead_score(row):
             elif "masterclass" in col_l:
                 score += 15
 
-    if row["conversion_category"] == "Paid / Admitted":
+    if row["paid_flag"]:
         score += 30
     elif row["conversion_category"] == "Will Pay":
         score += 15
@@ -233,9 +260,9 @@ st.title("📊 Engagement Analytics Dashboard")
 # Top Metrics
 # -------------------------------
 
-paid_count = (df["conversion_category"] == "Paid / Admitted").sum()
+paid_count = df["paid_flag"].sum()
 will_pay_count = (df["conversion_category"] == "Will Pay").sum()
-not_paid_count = (df["conversion_category"] == "Not Paid").sum()
+not_paid_count = len(df) - paid_count
 participants = (df["participation_count"] > 0).sum()
 conversion_rate = (paid_count / participants * 100) if participants > 0 else 0
 
@@ -263,9 +290,9 @@ st.dataframe(top_participants.head(50), use_container_width=True)
 
 st.header("2️⃣ Payment & Conversion Analysis")
 
-paid_df = df[df["conversion_category"] == "Paid / Admitted"]
+paid_df = df[df["paid_flag"]]
 will_pay_df = df[df["conversion_category"] == "Will Pay"]
-not_paid_df = df[df["conversion_category"] == "Not Paid"]
+not_paid_df = df[~df["paid_flag"]]
 
 st.subheader("✅ Paid / Admitted")
 st.dataframe(paid_df[[name_col, conversion_col, payment_col]] if payment_col else paid_df[[name_col, conversion_col]])
@@ -310,7 +337,7 @@ st.dataframe(no_participants[cols_to_show], use_container_width=True)
 st.header("5️⃣ Paid Students With Low / No Engagement")
 
 low_engaged_paid = df[
-    (df["conversion_category"] == "Paid / Admitted") &
+    (df["paid_flag"]) &
     (df["participation_count"] <= 1)
 ]
 
@@ -321,24 +348,36 @@ else:
     st.success("No low-engagement paid students found.")
 
 # -------------------------------
-# 6️⃣ Event-wise Participation
+# 6️⃣ Event-wise Participation (Counts + % + Pie)
 # -------------------------------
 
 st.header("6️⃣ Event-wise Participation")
 
 event_participation = df[event_columns].sum().sort_values(ascending=False)
+event_percentages = (event_participation / len(df) * 100).round(2)
 
+event_summary = pd.DataFrame({
+    "Event Name": event_participation.index,
+    "Participation Count": event_participation.values,
+    "Participation %": event_percentages.values
+})
+
+st.dataframe(event_summary, use_container_width=True)
+
+# Bar Chart
 fig1, ax1 = plt.subplots(figsize=(10, 5))
 event_participation.plot(kind="bar", ax=ax1)
-ax1.set_title("Event-wise Participation")
+ax1.set_title("Event-wise Participation Count")
 ax1.set_ylabel("Number of Students")
 ax1.set_xlabel("Events")
 plt.xticks(rotation=45, ha="right")
 st.pyplot(fig1)
 
-event_table = event_participation.reset_index()
-event_table.columns = ["Event Name", "Participation Count"]
-st.dataframe(event_table, use_container_width=True)
+# Pie Chart
+fig2, ax2 = plt.subplots(figsize=(6, 6))
+ax2.pie(event_participation, labels=event_participation.index, autopct="%1.1f%%", startangle=90)
+ax2.set_title("Event Participation Distribution")
+st.pyplot(fig2)
 
 # -------------------------------
 # 7️⃣ Per-Student Participation Timeline
@@ -360,30 +399,30 @@ for col in event_columns:
 timeline_df = pd.DataFrame(timeline_data)
 timeline_df["sequence"] = range(1, len(timeline_df) + 1)
 
-fig2, ax2 = plt.subplots(figsize=(12, 5))
+fig3, ax3 = plt.subplots(figsize=(12, 5))
 
-# Plot participation
+# Plot participation (only connect attended events)
 participated_df = timeline_df[timeline_df["participated"] == 1]
-ax2.plot(participated_df["sequence"], participated_df["participated"], marker="o", linestyle="-", label="Participated")
+ax3.plot(participated_df["sequence"], participated_df["participated"], marker="o", linestyle="-", label="Participated")
 
-# Plot non-participation as gaps (no line)
-non_participated_df = timeline_df[timeline_df["participated"] == 0]
-ax2.scatter(non_participated_df["sequence"], non_participated_df["participated"], marker="x", color="gray", label="Missed")
+# Plot missed events as scatter
+missed_df = timeline_df[timeline_df["participated"] == 0]
+ax3.scatter(missed_df["sequence"], missed_df["participated"], marker="x", color="gray", label="Missed")
 
 # Payment marker
 if payment_col and pd.notna(student_row[payment_col]):
     payment_seq = len(timeline_df) + 0.5
-    ax2.scatter(payment_seq, 1, marker="*", s=200, color="green", label="Payment Date ✔")
-    ax2.text(payment_seq, 1.05, "Payment", ha="center", color="green")
+    ax3.scatter(payment_seq, 1, marker="*", s=200, color="green", label="Payment Date ✔")
+    ax3.text(payment_seq, 1.05, "Payment", ha="center", color="green")
 
-ax2.set_title(f"Participation Timeline: {student_name}")
-ax2.set_xlabel("Event Sequence")
-ax2.set_ylabel("Participation (1 = Attended, 0 = Not Attended)")
-ax2.set_yticks([0, 1])
-ax2.set_xticks(timeline_df["sequence"])
-ax2.set_xticklabels(timeline_df["event"], rotation=45, ha="right")
-ax2.legend()
-st.pyplot(fig2)
+ax3.set_title(f"Participation Timeline: {student_name}")
+ax3.set_xlabel("Event Sequence")
+ax3.set_ylabel("Participation (1 = Attended, 0 = Not Attended)")
+ax3.set_yticks([0, 1])
+ax3.set_xticks(timeline_df["sequence"])
+ax3.set_xticklabels(timeline_df["event"], rotation=45, ha="right")
+ax3.legend()
+st.pyplot(fig3)
 
 # -------------------------------
 # Lead Score Leaderboard
