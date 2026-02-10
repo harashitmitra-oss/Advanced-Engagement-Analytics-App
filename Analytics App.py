@@ -1,346 +1,395 @@
-"""
-Advanced Engagement Analytics Streamlit App
-------------------------------------------
-Upload your Excel file and analyze student engagement, participation,
-conversions, lead scores, and per-student timelines.
-
-This version is built specifically to work with your uploaded file
-structure (multiple header rows, mixed Yes/No event columns, multiple sheets).
-
-Run with:
-    streamlit run app.py
-
-Dependencies:
-    pip install streamlit pandas numpy plotly openpyxl
-"""
-
-# -----------------------------
-# Imports
-# -----------------------------
+# === Advanced Engagement Analytics App (Robust, Production-Ready) ===
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
 from datetime import datetime
-import re
 
-# -----------------------------
-# Configuration
-# -----------------------------
+st.set_page_config(page_title="Engagement Analytics", layout="wide")
 
-EVENT_HEADER_ROW = 0   # Row with event names
-MAIN_HEADER_ROW = 2    # Row with main column headers
-DATA_START_ROW = 3     # First row of actual data
-
-BASE_COLUMNS = [
-    "Student Name",
-    "Phone Number",
-    "Conversion Status",
-    "Community Status",
-    "Payment Date",
-]
-
-# -----------------------------
-# Utility Functions
-# -----------------------------
+# -------------------------------------------------------------------
+# -------------------------- DATA LOADING ---------------------------
+# -------------------------------------------------------------------
 
 def normalize_yes_no(series):
-    """
-    Safely normalize any Yes/No style column to 0/1.
-    Handles NaN, blanks, Yes/No, True/False, 1/0, random text.
-    """
+    """Safely normalize Yes/No/Blank/NaN values to 1/0."""
     return (
         series
+        .fillna(0)
         .astype(str)
         .str.strip()
         .str.lower()
         .replace({
             "yes": 1, "y": 1, "true": 1, "1": 1,
             "no": 0, "n": 0, "false": 0, "0": 0,
-            "nan": 0, "": 0, "none": 0
+            "nan": 0, "": 0
         })
-        .apply(lambda x: 1 if x == 1 else 0)
+        .apply(lambda x: 1 if str(x).isdigit() and int(x) > 0 else int(x) if str(x).isdigit() else 0)
     )
 
 
-def parse_event_name_and_date(col_name):
-    """
-    Extract event name and date from column header like:
-    "Startup Hackathon (12-01-2024)"
-    """
-    match = re.search(r"(.*)\((\d{2}-\d{2}-\d{4})\)", str(col_name))
-    if match:
-        event_name = match.group(1).strip()
-        event_date = datetime.strptime(match.group(2), "%d-%m-%Y")
-    else:
-        event_name = str(col_name)
-        event_date = None
-    return event_name, event_date
+def make_columns_unique(cols):
+    """Ensure no duplicate column names."""
+    seen = {}
+    new_cols = []
+    for col in cols:
+        col = str(col).strip()
+        if col in seen:
+            seen[col] += 1
+            new_cols.append(f"{col}_{seen[col]}")
+        else:
+            seen[col] = 0
+            new_cols.append(col)
+    return new_cols
 
 
-def load_group_sheet(file, sheet_name,
-                     event_header_row=EVENT_HEADER_ROW,
-                     main_header_row=MAIN_HEADER_ROW,
-                     data_start_row=DATA_START_ROW):
+def find_column(df, keywords):
+    """Find first column that contains any keyword (case-insensitive)."""
+    for col in df.columns:
+        col_l = str(col).lower()
+        for kw in keywords:
+            if kw in col_l:
+                return col
+    return None
+
+
+def load_group_sheet(file, sheet_name):
     """
-    Load one sheet with messy multi-row headers and return:
-    - Clean dataframe
-    - Event columns
-    - Event metadata dataframe
+    Expected structure:
+    Row 0 -> Event names
+    Row 1 -> Event dates
+    Row 2 -> Main headers
+    Row 3+ -> Data
     """
+
     raw = pd.read_excel(file, sheet_name=sheet_name, header=None)
 
-    event_headers = raw.iloc[event_header_row].tolist()
-    main_headers = raw.iloc[main_header_row].tolist()
+    event_header_row = 0
+    date_header_row = 1
+    main_header_row = 2
+    data_start_row = 3
 
-    df = raw.iloc[data_start_row:].copy()
-    df.columns = main_headers
-    df = df.reset_index(drop=True)
+    event_headers = raw.iloc[event_header_row]
+    date_headers = raw.iloc[date_header_row]
+    main_headers = raw.iloc[main_header_row]
 
-    # Replace unnamed columns with event headers
-    for i, col in enumerate(df.columns):
-        if pd.isna(col) or str(col).lower().startswith("unnamed"):
-            if i < len(event_headers):
-                df.columns.values[i] = event_headers[i]
+    final_headers = []
+    event_cols = []
+    event_meta = []
 
-    # Identify event columns (everything except base columns)
-    event_cols = [col for col in df.columns if col not in BASE_COLUMNS]
+    for col_idx, base_col in enumerate(main_headers):
+        event_name = event_headers[col_idx]
+        event_date = date_headers[col_idx]
 
-    # Build event metadata
-    meta_rows = []
-    for col in event_cols:
-        name, date = parse_event_name_and_date(col)
-        meta_rows.append({
-            "Column": col,
-            "Event": name,
-            "Event Date": date
-        })
+        if pd.notna(event_name) and str(event_name).strip() != "":
+            col_name = str(event_name).strip()
+            final_headers.append(col_name)
+            event_cols.append(col_name)
+            event_meta.append({
+                "Column": col_name,
+                "Event Name": col_name,
+                "Event Date": event_date
+            })
+        else:
+            final_headers.append(str(base_col).strip())
 
-    event_meta_df = pd.DataFrame(meta_rows)
+    # Make columns unique to avoid pandas returning DataFrame instead of Series
+    final_headers = make_columns_unique(final_headers)
+
+    df = raw.iloc[data_start_row:].reset_index(drop=True)
+    df.columns = final_headers
+
+    event_meta_df = pd.DataFrame(event_meta)
 
     return df, event_cols, event_meta_df
 
 
-def build_events_long_df(df, event_cols, event_meta_df):
-    """
-    Convert wide Yes/No event columns into long event participation table.
-    """
-    df_events = df.copy()
-    df_events[event_cols] = df_events[event_cols].apply(normalize_yes_no)
+# -------------------------------------------------------------------
+# ----------------------- ANALYTICS FUNCTIONS ------------------------
+# -------------------------------------------------------------------
 
-    long_df = df_events.melt(
-        id_vars=["Student Name", "Phone Number"],
-        value_vars=event_cols,
-        var_name="Column",
-        value_name="Participated",
+def student_participation_analysis(df, event_cols, event_meta_df):
+    df = df.copy()
+
+    # Normalize events
+    for col in event_cols:
+        if col in df.columns:
+            df[col] = normalize_yes_no(df[col])
+
+    df["Total Events Participated"] = df[event_cols].sum(axis=1)
+
+    student_participation = df[["Student Name", "Total Events Participated"]]
+
+    event_participation = (
+        df[event_cols]
+        .sum()
+        .reset_index()
+        .rename(columns={"index": "Column", 0: "Participants"})
+        .merge(event_meta_df, on="Column", how="left")
     )
 
-    long_df = long_df[long_df["Participated"] == 1]
+    participants = []
+    for col in event_cols:
+        if col in df.columns:
+            participating_students = df.loc[df[col] == 1, "Student Name"].tolist()
+            participants.append({
+                "Column": col,
+                "Participants": participating_students
+            })
 
-    long_df = long_df.merge(event_meta_df, on="Column", how="left")
+    participants = pd.DataFrame(participants).merge(event_meta_df, on="Column", how="left")
 
-    return long_df[["Student Name", "Phone Number", "Event", "Event Date"]]
-
-
-def categorize_event(event_name):
-    name = str(event_name).lower()
-    if "hackathon" in name:
-        return "Startup Hackathon"
-    elif "ama" in name:
-        return "AMA"
-    elif "masterclass" in name:
-        return "Masterclass"
-    else:
-        return "Other"
+    return student_participation, event_participation, participants
 
 
-def calculate_lead_scores(df, events_long_df):
-    scores = []
-
-    for _, row in df.iterrows():
-        student = row.get("Student Name")
-        student_events = events_long_df[events_long_df["Student Name"] == student]
-
-        event_points = len(student_events)
-        hackathon_points = student_events[student_events["Event"].str.contains("hackathon", case=False, na=False)].shape[0] * 3
-        ama_points = student_events[student_events["Event"].str.contains("ama", case=False, na=False)].shape[0] * 2
-        masterclass_points = student_events[student_events["Event"].str.contains("masterclass", case=False, na=False)].shape[0] * 2
-
-        conversion_points = 5 if str(row.get("Conversion Status", "")).lower() in ["paid", "admitted", "will pay"] else 0
-        retention_points = 3 if str(row.get("Community Status", "")).lower() == "in" else 0
-
-        total_score = (
-            event_points
-            + hackathon_points
-            + ama_points
-            + masterclass_points
-            + conversion_points
-            + retention_points
-        )
-
-        scores.append({
-            "Student Name": student,
-            "Lead Score": total_score,
-        })
-
-    return pd.DataFrame(scores)
-
-# -----------------------------
-# Streamlit App
-# -----------------------------
+# -------------------------------------------------------------------
+# ----------------------- STREAMLIT APP ------------------------------
+# -------------------------------------------------------------------
 
 def run_streamlit_app():
-    st.set_page_config(page_title="Advanced Engagement Analytics", layout="wide")
-    st.title("🎓 Advanced Engagement Analytics & Timelines")
+    st.title("📊 Advanced Engagement Analytics")
 
-    uploaded_file = st.file_uploader("Upload your Excel file", type=["xlsx"])
+    uploaded_file = st.file_uploader("Upload your Master Engagement Tracker Excel file", type=["xlsx"])
 
     if not uploaded_file:
-        st.info("Please upload your engagement tracker Excel file to continue.")
+        st.info("Please upload your Excel file to continue.")
         return
 
     xls = pd.ExcelFile(uploaded_file)
     sheet_names = xls.sheet_names
 
-    st.sidebar.title("📂 Groups")
-    selected_sheet = st.sidebar.selectbox("Select a group", sheet_names)
+    selected_sheet = st.sidebar.selectbox("Select Group / Sheet", sheet_names)
 
     df, event_cols, event_meta_df = load_group_sheet(uploaded_file, selected_sheet)
 
-    events_long_df = build_events_long_df(df, event_cols, event_meta_df)
+    st.subheader("Raw Data Preview")
+    st.dataframe(df.head())
 
-    # -----------------------------
-    # Student Participation Analysis
-    # -----------------------------
-    st.header("📊 Student Participation Analysis")
+    # ------------------- SAFE COLUMN DETECTION -------------------
+    conversion_col = find_column(df, ["conversion status", "conversion"]) 
+    community_col = find_column(df, ["community status", "community"]) 
+    payment_date_col = find_column(df, ["payment date", "payment"]) 
 
-    total_participants = events_long_df["Student Name"].nunique()
-    st.metric("Total Participants", total_participants)
+    # ------------------- PAYMENT & CONVERSION -------------------
+    st.header("💰 Payment & Conversion Analysis")
 
-    st.subheader("List of Participating Students")
-    st.dataframe(events_long_df[["Student Name", "Phone Number"]].drop_duplicates())
+    if conversion_col:
+        conv_series = df[conversion_col]
+        if isinstance(conv_series, pd.DataFrame):
+            conv_series = conv_series.iloc[:, 0]
+
+        conv_series = conv_series.astype(str).str.lower()
+        paid_mask = conv_series.str.contains("paid|admitted|will pay", na=False)
+        paid_students = df.loc[paid_mask]
+
+        st.subheader("Students Who Paid / High Intent")
+        st.dataframe(paid_students[["Student Name", conversion_col]])
+
+        total_students = len(df)
+        total_paid = paid_mask.sum()
+        conversion_rate = round((total_paid / total_students) * 100, 2) if total_students else 0
+
+        st.metric("Total Students", total_students)
+        st.metric("Paid / High Intent", total_paid)
+        st.metric("Conversion Rate (%)", conversion_rate)
+    else:
+        st.warning("⚠️ Conversion Status column not found.")
+
+    if community_col:
+        community_series = df[community_col]
+        if isinstance(community_series, pd.DataFrame):
+            community_series = community_series.iloc[:, 0]
+
+        retained_mask = community_series.astype(str).str.lower().str.contains("in|retained", na=False)
+        retention_rate = round((retained_mask.sum() / len(df)) * 100, 2) if len(df) else 0
+        st.metric("Retention Rate (%)", retention_rate)
+    else:
+        st.warning("⚠️ Community Status column not found.")
+
+    # ------------------- PARTICIPATION ANALYSIS -------------------
+    st.header("📈 Participation Analysis")
+
+    student_participation, event_participation, participants = student_participation_analysis(
+        df, event_cols, event_meta_df
+    )
 
     st.subheader("Student-wise Participation")
-    student_counts = events_long_df["Student Name"].value_counts().reset_index()
-    student_counts.columns = ["Student Name", "Participation Count"]
-    fig1 = px.bar(student_counts, x="Student Name", y="Participation Count")
+    st.dataframe(student_participation.sort_values("Total Events Participated", ascending=False))
+
+    fig1 = px.bar(student_participation, x="Student Name", y="Total Events Participated",
+                  title="Student-wise Participation Count")
     st.plotly_chart(fig1, use_container_width=True)
 
     st.subheader("Event-wise Participation")
-    event_counts = events_long_df["Event"].value_counts().reset_index()
-    event_counts.columns = ["Event", "Participants"]
-    fig2 = px.bar(event_counts, x="Event", y="Participants")
+    st.dataframe(event_participation.sort_values("Participants", ascending=False))
+
+    fig2 = px.bar(event_participation, x="Event Name", y="Participants",
+                  title="Event-wise Participation Count")
     st.plotly_chart(fig2, use_container_width=True)
 
-    st.subheader("Participation Percentage")
-    fig3 = px.pie(event_counts, names="Event", values="Participants")
+    total_participants = (student_participation["Total Events Participated"] > 0).sum()
+    non_participants = len(df) - total_participants
+
+    fig3 = px.pie(
+        names=["Participated", "Did Not Participate"],
+        values=[total_participants, non_participants],
+        title="Participation Percentage"
+    )
     st.plotly_chart(fig3, use_container_width=True)
 
-    # -----------------------------
-    # Payment & Conversion Analysis
-    # -----------------------------
-    st.header("💳 Payment & Conversion Analysis")
-
-    paid_mask = df["Conversion Status"].astype(str).str.lower().str.contains("paid|admitted|will pay", na=False)
-    paid_students = df[paid_mask]
-
-    st.subheader("Students Who Paid / Will Pay / Admitted")
-    st.dataframe(paid_students[["Student Name", "Phone Number", "Conversion Status", "Payment Date"]])
-
-    paid_participants = events_long_df[events_long_df["Student Name"].isin(paid_students["Student Name"])]
-
-    participation_rate_paid = (
-        paid_participants["Student Name"].nunique() / paid_students.shape[0]
-        if paid_students.shape[0] > 0 else 0
-    )
-
-    conversion_rate = paid_students.shape[0] / df.shape[0] if df.shape[0] > 0 else 0
-    retention_rate = df[df["Community Status"].astype(str).str.lower() == "in"].shape[0] / df.shape[0] if df.shape[0] > 0 else 0
-
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Participation Rate (Paid)", f"{participation_rate_paid:.2%}")
-    col2.metric("Conversion Rate", f"{conversion_rate:.2%}")
-    col3.metric("Retention Rate", f"{retention_rate:.2%}")
-
-    st.info("🏆 Winners who paid logic is future-ready and can be added when winner data is available.")
-
-    # -----------------------------
-    # Event Category Analysis
-    # -----------------------------
+    # ------------------- EVENT CATEGORY ANALYSIS -------------------
     st.header("🗂 Event Category Analysis")
 
-    events_long_df["Category"] = events_long_df["Event"].apply(categorize_event)
+    def categorize_event(name):
+        name_l = str(name).lower()
+        if "hackathon" in name_l:
+            return "Startup Hackathon"
+        elif "ama" in name_l:
+            return "AMA"
+        elif "masterclass" in name_l:
+            return "Masterclass"
+        else:
+            return "Other"
 
-    for category in ["Startup Hackathon", "AMA", "Masterclass"]:
-        st.subheader(category)
-        cat_df = events_long_df[events_long_df["Category"] == category]
+    event_meta_df["Category"] = event_meta_df["Event Name"].apply(categorize_event)
 
-        participation_rate = cat_df["Student Name"].nunique() / df.shape[0] if df.shape[0] > 0 else 0
-        st.metric("Participation Rate", f"{participation_rate:.2%}")
-        st.dataframe(cat_df[["Student Name", "Phone Number", "Event"]].drop_duplicates())
+    for category in event_meta_df["Category"].unique():
+        st.subheader(f"{category}")
+        cat_events = event_meta_df[event_meta_df["Category"] == category]["Column"].tolist()
 
-    # -----------------------------
-    # Lead Scoring System
-    # -----------------------------
-    st.header("🏅 Lead Scoring System")
+        cat_participants = df[cat_events].sum().sum() if cat_events else 0
+        cat_students = df.loc[df[cat_events].sum(axis=1) > 0, "Student Name"].tolist() if cat_events else []
 
-    lead_scores_df = calculate_lead_scores(df, events_long_df)
-    leaderboard = lead_scores_df.sort_values(by="Lead Score", ascending=False)
+        st.metric("Total Participations", cat_participants)
+        st.write("Students:")
+        st.write(cat_students)
 
-    st.subheader("Top Students by Lead Score")
-    st.dataframe(leaderboard)
+    # ------------------- LEAD SCORING SYSTEM -------------------
+    st.header("🏆 Lead Scoring System")
 
-    st.subheader("Lead Score Distribution")
-    fig4 = px.histogram(lead_scores_df, x="Lead Score", nbins=20)
+    df_scoring = df.copy()
+
+    for col in event_cols:
+        if col in df_scoring.columns:
+            df_scoring[col] = normalize_yes_no(df_scoring[col])
+
+    df_scoring["Event Points"] = df_scoring[event_cols].sum(axis=1)
+
+    df_scoring["Category Points"] = 0
+    for _, row in event_meta_df.iterrows():
+        col = row["Column"]
+        category = row["Category"]
+        if col in df_scoring.columns:
+            if category == "Startup Hackathon":
+                df_scoring["Category Points"] += df_scoring[col] * 3
+            elif category == "AMA":
+                df_scoring["Category Points"] += df_scoring[col] * 2
+            elif category == "Masterclass":
+                df_scoring["Category Points"] += df_scoring[col] * 2
+            else:
+                df_scoring["Category Points"] += df_scoring[col] * 1
+
+    if conversion_col:
+        conv_series = df_scoring[conversion_col]
+        if isinstance(conv_series, pd.DataFrame):
+            conv_series = conv_series.iloc[:, 0]
+
+        conv_series = conv_series.astype(str).str.lower()
+        df_scoring["Conversion Points"] = np.where(
+            conv_series.str.contains("paid|admitted", na=False), 10,
+            np.where(conv_series.str.contains("will pay", na=False), 5, 0)
+        )
+    else:
+        df_scoring["Conversion Points"] = 0
+
+    if community_col:
+        comm_series = df_scoring[community_col]
+        if isinstance(comm_series, pd.DataFrame):
+            comm_series = comm_series.iloc[:, 0]
+
+        comm_series = comm_series.astype(str).str.lower()
+        df_scoring["Retention Points"] = np.where(comm_series.str.contains("in|retained", na=False), 5, 0)
+    else:
+        df_scoring["Retention Points"] = 0
+
+    df_scoring["Lead Score"] = (
+        df_scoring["Event Points"] +
+        df_scoring["Category Points"] +
+        df_scoring["Conversion Points"] +
+        df_scoring["Retention Points"]
+    )
+
+    leaderboard = df_scoring[["Student Name", "Lead Score"]].sort_values("Lead Score", ascending=False)
+
+    st.subheader("Top Leads")
+    st.dataframe(leaderboard.head(20))
+
+    fig4 = px.histogram(df_scoring, x="Lead Score", title="Lead Score Distribution")
     st.plotly_chart(fig4, use_container_width=True)
 
-    # -----------------------------
-    # Per-Student Timeline Visualization
-    # -----------------------------
-    st.header("🕒 Per-Student Timeline Visualization")
+    # ------------------- STUDENT TIMELINE -------------------
+    st.header("🕒 Per-Student Timeline")
 
-    student_list = sorted(df["Student Name"].dropna().unique())
-    selected_student = st.selectbox("Select a student", student_list)
+    selected_student = st.selectbox("Select Student", df["Student Name"].dropna().unique())
 
-    student_events = events_long_df[events_long_df["Student Name"] == selected_student].copy()
+    student_row = df[df["Student Name"] == selected_student].iloc[0]
 
-    if not student_events.empty:
-        student_events = student_events.sort_values(by="Event Date")
+    timeline_data = []
 
-        fig = px.scatter(
-            student_events,
-            x="Event Date",
-            y=[1] * len(student_events),
+    for _, row in event_meta_df.iterrows():
+        col = row["Column"]
+        event_name = row["Event Name"]
+        event_date = row["Event Date"]
+
+        if col in df.columns:
+            value = student_row[col]
+            value_norm = normalize_yes_no(pd.Series([value])).iloc[0]
+
+            if value_norm == 1:
+                try:
+                    event_date_parsed = pd.to_datetime(event_date, errors="coerce")
+                except:
+                    event_date_parsed = None
+
+                timeline_data.append({
+                    "Date": event_date_parsed,
+                    "Event": event_name,
+                    "Type": "Event"
+                })
+
+    if payment_date_col:
+        payment_val = student_row[payment_date_col]
+        try:
+            payment_date = pd.to_datetime(payment_val, errors="coerce")
+        except:
+            payment_date = None
+
+        if pd.notna(payment_date):
+            timeline_data.append({
+                "Date": payment_date,
+                "Event": "Payment ✔",
+                "Type": "Payment"
+            })
+
+    timeline_df = pd.DataFrame(timeline_data)
+    timeline_df = timeline_df.dropna(subset=["Date"])
+
+    if not timeline_df.empty:
+        fig5 = px.scatter(
+            timeline_df,
+            x="Date",
+            y=[1]*len(timeline_df),
+            color="Type",
             text="Event",
+            title=f"Timeline for {selected_student}"
         )
-        fig.update_traces(textposition="top center")
-        fig.update_yaxes(visible=False)
-
-        # Payment marker
-        payment_row = df[df["Student Name"] == selected_student]
-        if not payment_row.empty and pd.notna(payment_row.iloc[0].get("Payment Date")):
-            try:
-                payment_date = pd.to_datetime(payment_row.iloc[0].get("Payment Date"))
-                fig.add_scatter(
-                    x=[payment_date],
-                    y=[1],
-                    mode="markers+text",
-                    text=["✔ Paid"],
-                    textposition="bottom center",
-                    marker=dict(size=14, color="green"),
-                )
-            except Exception:
-                pass
-
-        st.plotly_chart(fig, use_container_width=True)
+        fig5.update_traces(textposition="top center")
+        fig5.update_yaxes(visible=False)
+        st.plotly_chart(fig5, use_container_width=True)
     else:
-        st.warning("No event participation found for this student.")
+        st.info("No timeline data available for this student.")
 
-
-# -----------------------------
-# Run App
-# -----------------------------
 
 if __name__ == "__main__":
     run_streamlit_app()
