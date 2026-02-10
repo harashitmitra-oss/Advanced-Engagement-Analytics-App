@@ -22,7 +22,7 @@ selected_sheet = st.sidebar.selectbox("Select a sheet", sheet_names)
 raw = pd.read_excel(uploaded_file, sheet_name=selected_sheet, header=None)
 
 # ===============================
-# ROBUST HEADER ROW DETECTION
+# HEADER ROW DETECTION
 # ===============================
 
 def detect_header_row(df):
@@ -33,14 +33,13 @@ def detect_header_row(df):
             or row.str.contains("student").any()
             or row.str.contains("email").any()
             or row.str.contains("mobile").any()
-            or row.str.contains("country").any()
         ):
             return i
     return None
 
 header_row = detect_header_row(raw)
 if header_row is None:
-    st.error("❌ Could not detect header row. Please ensure the sheet contains student identifiers like Name, Email, or Mobile.")
+    st.error("❌ Could not detect header row. Please ensure a row contains student identifiers (Name, Email, Mobile).")
     st.stop()
 
 # ===============================
@@ -61,8 +60,11 @@ df.columns = (
     .str.strip()
 )
 
+# Remove duplicate columns safely
+df = df.loc[:, ~df.columns.duplicated()]
+
 # ===============================
-# SMART COLUMN DETECTION
+# COLUMN DETECTION
 # ===============================
 
 def find_col(columns, keywords):
@@ -79,7 +81,7 @@ conversion_col = find_col(df.columns, ["conversion"])
 payment_col = find_col(df.columns, ["payment", "date", "paid"])
 
 if not name_col:
-    st.error("❌ Student Name column not detected. Please ensure a column contains 'Name' or 'Student'.")
+    st.error("❌ Student Name column not detected.")
     st.stop()
 
 # ===============================
@@ -193,7 +195,7 @@ def calculate_lead_score(row):
 df["lead_score"] = df.apply(calculate_lead_score, axis=1)
 
 # ===============================
-# DASHBOARD UI
+# DASHBOARD
 # ===============================
 
 st.title("📊 Engagement Analytics Dashboard")
@@ -210,9 +212,9 @@ col2.metric("Will Pay", will_pay_count)
 col3.metric("Not Paid", not_paid_count)
 col4.metric("Conversion Rate", f"{conversion_rate:.2f}%")
 
-# ===============================
+# -------------------------------
 # 1️⃣ TOP PARTICIPANTS
-# ===============================
+# -------------------------------
 
 st.header("1️⃣ Top Participating Students")
 st.dataframe(
@@ -222,9 +224,9 @@ st.dataframe(
     use_container_width=True
 )
 
-# ===============================
+# -------------------------------
 # 2️⃣ PAYMENT & CONVERSION
-# ===============================
+# -------------------------------
 
 st.header("2️⃣ Payment & Conversion Analysis")
 
@@ -244,9 +246,9 @@ st.dataframe(will_pay_df[[name_col, conversion_col]], use_container_width=True)
 st.subheader("🔴 Not Paid")
 st.dataframe(not_paid_df[[name_col, conversion_col]], use_container_width=True)
 
-# ===============================
+# -------------------------------
 # 3️⃣ RETENTION
-# ===============================
+# -------------------------------
 
 st.header("3️⃣ Retention Analysis")
 
@@ -259,9 +261,9 @@ if payment_col:
 else:
     st.info("Retention analysis not available for this sheet (no Payment Date column).")
 
-# ===============================
+# -------------------------------
 # 4️⃣ NO PARTICIPATION
-# ===============================
+# -------------------------------
 
 st.header("4️⃣ Students With NO Event Participation")
 cols_np = [name_col, conversion_col]
@@ -269,9 +271,9 @@ if payment_col:
     cols_np.append(payment_col)
 st.dataframe(df[df["participation_count"] == 0][cols_np], use_container_width=True)
 
-# ===============================
+# -------------------------------
 # 5️⃣ LOW ENGAGEMENT PAID
-# ===============================
+# -------------------------------
 
 st.header("5️⃣ Paid Students With Low / No Engagement")
 low_engaged_paid = df[
@@ -288,9 +290,9 @@ if not low_engaged_paid.empty:
 else:
     st.success("No low-engagement paid students found.")
 
-# ===============================
+# -------------------------------
 # 6️⃣ EVENT-WISE PARTICIPATION
-# ===============================
+# -------------------------------
 
 st.header("6️⃣ Event-wise Participation")
 
@@ -318,9 +320,9 @@ ax_pie.pie(event_participation, labels=event_participation.index, autopct="%1.1f
 ax_pie.set_title("Event Participation Distribution")
 st.pyplot(fig_pie)
 
-# ===============================
+# -------------------------------
 # 7️⃣ PER-STUDENT TIMELINE
-# ===============================
+# -------------------------------
 
 st.header("7️⃣ Per-Student Participation Timeline")
 
@@ -354,9 +356,9 @@ ax2.set_xticklabels(timeline_df["event"], rotation=45, ha="right")
 ax2.legend()
 st.pyplot(fig2)
 
-# ===============================
+# -------------------------------
 # 8️⃣ LEAD SCORE LEADERBOARD
-# ===============================
+# -------------------------------
 
 st.header("🏆 Lead Score Leaderboard")
 st.dataframe(
@@ -366,9 +368,9 @@ st.dataframe(
     use_container_width=True
 )
 
-# ===============================
+# -------------------------------
 # 9️⃣ CONVERSION STATUS BREAKDOWN
-# ===============================
+# -------------------------------
 
 st.header("9️⃣ Conversion Status Category Breakdown")
 conversion_summary = df["conversion_category"].value_counts().reset_index()
