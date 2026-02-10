@@ -7,7 +7,7 @@ st.set_page_config(page_title="Engagement Analytics", layout="wide")
 
 
 # ----------------------------- #
-# 🔧 UTILS
+# 🔧 UTILITIES
 # ----------------------------- #
 def make_columns_unique(cols):
     seen = {}
@@ -47,6 +47,16 @@ def find_column(df, keywords):
     return None
 
 
+def is_metadata_column(col):
+    col_l = str(col).lower()
+    metadata_keywords = [
+        "name", "email", "mobile", "phone", "country", "income", "batch",
+        "community", "status", "date", "score", "conversion", "payment",
+        "admitted", "remarks", "notes"
+    ]
+    return any(kw in col_l for kw in metadata_keywords)
+
+
 # ----------------------------- #
 # 📥 LOAD & PARSE SHEET
 # ----------------------------- #
@@ -54,15 +64,16 @@ def find_column(df, keywords):
 def load_group_sheet(uploaded_file, sheet_name):
     raw = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=None)
 
-    # Find header row
+    # Detect header row (row containing "Student" or "Name")
     header_row = None
-    for i in range(6):
-        if raw.iloc[i].astype(str).str.contains("student", case=False).any():
+    for i in range(min(10, len(raw))):
+        row_str = raw.iloc[i].astype(str).str.lower()
+        if row_str.str.contains("student").any() or row_str.str.contains("name").any():
             header_row = i
             break
 
     if header_row is None:
-        raise ValueError("Could not detect header row.")
+        raise ValueError("❌ Could not detect header row.")
 
     headers = raw.iloc[header_row].fillna("").astype(str)
     headers = make_columns_unique(headers)
@@ -70,20 +81,31 @@ def load_group_sheet(uploaded_file, sheet_name):
     df = raw.iloc[header_row + 1:].reset_index(drop=True)
     df.columns = headers
 
-    # Detect event columns (Yes/No heavy columns)
+    # Drop completely empty columns
+    df = df.dropna(axis=1, how="all")
+
+    # Detect event columns (Yes/No columns that are NOT metadata)
     event_cols = []
     for col in df.columns:
         try:
+            if is_metadata_column(col):
+                continue
+
             series = df[col]
             if isinstance(series, pd.DataFrame):
                 series = series.iloc[:, 0]
+
             sample = series.dropna().astype(str).str.lower()
-            if len(sample) > 0 and sample.isin(["yes", "no", "y", "n", "1", "0"]).mean() > 0.5:
+            if len(sample) == 0:
+                continue
+
+            yes_no_ratio = sample.isin(["yes", "no", "y", "n", "1", "0", "true", "false"]).mean()
+            if yes_no_ratio > 0.5:
                 event_cols.append(col)
         except:
             continue
 
-    event_meta_df = pd.DataFrame({"Column": event_cols, "Event": event_cols})
+    event_meta_df = pd.DataFrame({"Event Column": event_cols, "Event Name": event_cols})
 
     return df, event_cols, event_meta_df
 
@@ -126,12 +148,12 @@ def conversion_and_retention_analysis(df, event_cols, payment_date_col, conversi
         conv_series = df[conversion_col]
         if isinstance(conv_series, pd.DataFrame):
             conv_series = conv_series.iloc[:, 0]
-        df["Conversion Status Clean"] = conv_series.astype(str).str.strip().str.lower()
+        df["Conversion Status Clean"] = conv_series.astype(str).str.strip()
     else:
         df["Conversion Status Clean"] = ""
 
-    paid_mask = df["Conversion Status Clean"].str.contains("paid|admitted", na=False)
-    will_pay_mask = df["Conversion Status Clean"].str.contains("will pay", na=False)
+    paid_mask = df["Conversion Status Clean"].str.contains("paid|admitted", case=False, na=False)
+    will_pay_mask = df["Conversion Status Clean"].str.contains("will pay", case=False, na=False)
     not_paid_mask = ~(paid_mask | will_pay_mask)
 
     paid_students = df[paid_mask]
@@ -141,7 +163,6 @@ def conversion_and_retention_analysis(df, event_cols, payment_date_col, conversi
     engaged_students = df[df["Total Participation"] > 0]
     conversion_rate = (len(paid_students) / len(engaged_students) * 100) if len(engaged_students) > 0 else 0
 
-    # Retention = Paid students who participated AFTER payment date
     retained_students = []
     retention_rate = 0
 
@@ -151,7 +172,6 @@ def conversion_and_retention_analysis(df, event_cols, payment_date_col, conversi
             if pd.isna(payment_date):
                 continue
 
-            # If participated in ANY event (future-ready placeholder)
             if row["Total Participation"] > 0:
                 retained_students.append(row["Student Name"])
 
@@ -183,7 +203,6 @@ def plot_student_timeline(df, event_cols, student_name, payment_date_col):
     plt.title(f"Participation Timeline: {student_name}")
     plt.grid(True)
 
-    # Green tick for payment
     if payment_date_col:
         payment_val = row.get(payment_date_col)
         payment_date = pd.to_datetime(payment_val, errors="coerce")
@@ -212,8 +231,8 @@ def run_streamlit_app():
     df, event_participation, participants = student_participation_analysis(df, event_cols)
 
     # Detect key columns
-    conversion_col = find_column(df, ["conversion status", "conversion"])
-    payment_date_col = find_column(df, ["payment date", "date of payment", "payment"])
+    conversion_col = find_column(df, ["conversion status", "conversion", "payment status"])
+    payment_date_col = find_column(df, ["payment date", "date of payment", "paid on"])
     community_col = find_column(df, ["community status", "community"])
 
     conv_metrics = conversion_and_retention_analysis(df, event_cols, payment_date_col, conversion_col)
@@ -224,9 +243,11 @@ def run_streamlit_app():
     st.subheader("🏆 Top Participating Students")
 
     if "Student Name" in df.columns:
-        top_students = df.sort_values("Total Participation", ascending=False)[
-            ["Student Name", "Total Participation"] + ([conversion_col] if conversion_col else [])
-        ].head(20)
+        cols = ["Student Name", "Total Participation"]
+        if conversion_col:
+            cols.append(conversion_col)
+
+        top_students = df.sort_values("Total Participation", ascending=False)[cols].head(20)
         st.dataframe(top_students, use_container_width=True)
     else:
         st.warning("Student Name column not found.")
@@ -244,12 +265,12 @@ def run_streamlit_app():
 
     if not conv_metrics["paid_students"].empty:
         st.write("✅ Paid / Admitted Students")
-        st.dataframe(conv_metrics["paid_students"][["Student Name"] + ([conversion_col] if conversion_col else [])],
+        st.dataframe(conv_metrics["paid_students"][["Student Name", "Conversion Status Clean"]],
                      use_container_width=True)
 
     if not conv_metrics["will_pay_students"].empty:
         st.write("🟡 Will Pay Students")
-        st.dataframe(conv_metrics["will_pay_students"][["Student Name"] + ([conversion_col] if conversion_col else [])],
+        st.dataframe(conv_metrics["will_pay_students"][["Student Name", "Conversion Status Clean"]],
                      use_container_width=True)
 
     # ----------------------------- #
