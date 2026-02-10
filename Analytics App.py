@@ -3,15 +3,27 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Engagement Analytics", layout="wide")
+# ---------------------------------
+# Utility Functions
+# ---------------------------------
+
+def make_columns_unique(df):
+    cols = pd.Series(df.columns)
+    for dup in cols[cols.duplicated()].unique():
+        dup_idx = cols[cols == dup].index.tolist()
+        for i, idx in enumerate(dup_idx):
+            if i == 0:
+                continue
+            cols[idx] = f"{dup}_{i}"
+    df.columns = cols
+    return df
 
 
-# ----------------------------- #
-# 🔧 HELPERS
-# ----------------------------- #
 def normalize_yes_no(series):
     return (
-        series.astype(str)
+        series
+        .fillna(0)
+        .astype(str)
         .str.strip()
         .str.lower()
         .replace({
@@ -19,302 +31,261 @@ def normalize_yes_no(series):
             "no": 0, "n": 0, "false": 0, "0": 0,
             "nan": 0, "none": 0, "": 0
         })
-        .apply(pd.to_numeric, errors="coerce")
-        .fillna(0)
+        .apply(lambda x: 1 if str(x).isdigit() and int(x) > 0 else 0)
         .astype(int)
     )
 
 
 def find_column(df, keywords):
     for col in df.columns:
-        col_l = str(col).lower()
         for kw in keywords:
-            if kw in col_l:
+            if kw in col.lower():
                 return col
     return None
 
 
-def make_unique_columns(cols):
-    seen = {}
-    new_cols = []
-    for col in cols:
-        col = str(col).strip()
-        if col in seen:
-            seen[col] += 1
-            new_cols.append(f"{col}_{seen[col]}")
-        else:
-            seen[col] = 0
-            new_cols.append(col)
-    return new_cols
+# ---------------------------------
+# Streamlit App
+# ---------------------------------
 
-
-# ----------------------------- #
-# 📥 LOAD SHEET (ROBUST)
-# ----------------------------- #
-@st.cache_data
-def load_group_sheet(uploaded_file, sheet_name):
-    raw = pd.read_excel(uploaded_file, sheet_name=sheet_name, header=None)
-
-    # Row 0 → Event names
-    event_names_row = raw.iloc[0].fillna("").astype(str)
-
-    # Row 2 → Actual column headers
-    header_row = 2
-    headers = raw.iloc[header_row].fillna("").astype(str)
-    headers = make_unique_columns(headers)
-
-    df = raw.iloc[header_row + 1:].reset_index(drop=True)
-    df.columns = headers
-
-    # Drop fully empty rows
-    df = df.dropna(how="all")
-
-    # Remove summary rows (where Student Name is numeric or blank)
-    if "Student Name" in df.columns:
-        df = df[df["Student Name"].astype(str).str.strip().str.isalpha() | df["Student Name"].astype(str).str.contains(" ")]
-    else:
-        raise ValueError("Student Name column not found.")
-
-    # Detect metadata columns
-    metadata_cols = [
-        "Student Name", "E mail", "Phone Number", "Country", "Income", "Batch",
-        "Data Added to the community", "Community Status", "Date of Exit",
-        "Conversion Status", "Conversion Status_1", "Overall Engagement Score",
-        "Payment Date", "Comments"
-    ]
-
-    # Event columns = everything else
-    event_cols = [col for col in df.columns if col not in metadata_cols]
-
-    # Clean event columns
-    for col in event_cols:
-        df[col] = normalize_yes_no(df[col])
-
-    # Event names aligned with event columns
-    event_names = event_names_row.iloc[df.columns.get_indexer(event_cols)].tolist()
-    event_names = [name if name != "" else f"Event {i+1}" for i, name in enumerate(event_names)]
-
-    return df.reset_index(drop=True), event_cols, event_names
-
-
-# ----------------------------- #
-# 📊 PARTICIPATION ANALYSIS
-# ----------------------------- #
-def student_participation_analysis(df, event_cols):
-    df = df.copy()
-    df["Total Participation"] = df[event_cols].sum(axis=1)
-
-    event_participation = df[event_cols].sum().reset_index()
-    event_participation.columns = ["Event", "Participants"]
-
-    return df, event_participation
-
-
-# ----------------------------- #
-# 💰 CONVERSION & RETENTION
-# ----------------------------- #
-def conversion_and_retention_analysis(df, conversion_col, payment_date_col):
-    df = df.copy()
-
-    if conversion_col:
-        df["Conversion Status Clean"] = df[conversion_col].astype(str).str.strip()
-    else:
-        df["Conversion Status Clean"] = ""
-
-    paid_mask = df["Conversion Status Clean"].str.contains("paid|admitted", case=False, na=False)
-    will_pay_mask = df["Conversion Status Clean"].str.contains("will pay", case=False, na=False)
-    not_paid_mask = ~(paid_mask | will_pay_mask)
-
-    paid_students = df[paid_mask]
-    will_pay_students = df[will_pay_mask]
-    not_paid_students = df[not_paid_mask]
-
-    engaged_students = df[df["Total Participation"] > 0]
-    conversion_rate = (len(paid_students) / len(engaged_students) * 100) if len(engaged_students) > 0 else 0
-
-    retained_students = []
-    retention_rate = 0
-
-    if payment_date_col and not paid_students.empty:
-        for _, row in paid_students.iterrows():
-            payment_date = pd.to_datetime(row.get(payment_date_col), errors="coerce")
-            if not pd.isna(payment_date) and row["Total Participation"] > 0:
-                retained_students.append(row["Student Name"])
-
-        retention_rate = (len(retained_students) / len(paid_students) * 100) if len(paid_students) > 0 else 0
-
-    return {
-        "paid_students": paid_students,
-        "will_pay_students": will_pay_students,
-        "not_paid_students": not_paid_students,
-        "conversion_rate": conversion_rate,
-        "retained_students": retained_students,
-        "retention_rate": retention_rate
-    }
-
-
-# ----------------------------- #
-# 📈 STUDENT TIMELINE
-# ----------------------------- #
-def plot_student_timeline(df, event_cols, event_names, student_name, payment_date_col):
-    row = df[df["Student Name"] == student_name].iloc[0]
-
-    y = [row[col] for col in event_cols]
-    x = list(range(len(y)))
-
-    labels = event_names[:len(y)]
-
-    plt.figure(figsize=(12, 4))
-    plt.plot(x, y, marker="o")
-    plt.xticks(x, labels, rotation=45, ha="right")
-    plt.ylabel("Participation (1 = Yes, 0 = No)")
-    plt.title(f"Participation Timeline: {student_name}")
-    plt.grid(True)
-
-    if payment_date_col:
-        payment_val = row.get(payment_date_col)
-        payment_date = pd.to_datetime(payment_val, errors="coerce")
-        if not pd.isna(payment_date):
-            plt.scatter(x[-1], 1, marker="v", color="green", s=150)
-            plt.text(x[-1], 1.1, "✔ Paid", color="green", ha="center")
-
-    st.pyplot(plt)
-
-
-# ----------------------------- #
-# 🚀 STREAMLIT APP
-# ----------------------------- #
 def run_streamlit_app():
-    st.title("🎯 Advanced Engagement Analytics Dashboard")
+    st.set_page_config(page_title="Advanced Engagement Analytics", layout="wide")
+    st.title("📊 Advanced Engagement Analytics Dashboard")
 
-    uploaded_file = st.file_uploader("Upload Master Engagement Tracker Excel", type=["xlsx"])
-    if not uploaded_file:
-        st.warning("Please upload your Excel file.")
+    uploaded_file = st.file_uploader("Upload Engagement Excel File", type=["xlsx"])
+
+    if uploaded_file is None:
+        st.info("Please upload your Excel file to continue.")
         return
 
-    xls = pd.ExcelFile(uploaded_file)
-    sheet_name = st.selectbox("Select Sheet / Group", xls.sheet_names)
+    # Load file
+    df = pd.read_excel(uploaded_file, sheet_name=0)
+    df = make_columns_unique(df)
 
-    df, event_cols, event_names = load_group_sheet(uploaded_file, sheet_name)
-    df, event_participation = student_participation_analysis(df, event_cols)
+    st.success("File uploaded successfully!")
 
-    conversion_col = find_column(df, ["conversion status"])
-    payment_date_col = find_column(df, ["payment date"])
+    # Preview
+    with st.expander("🔍 Preview Raw Data"):
+        st.dataframe(df.head(20))
 
-    conv_metrics = conversion_and_retention_analysis(df, conversion_col, payment_date_col)
+    # ---------------------------------
+    # Column Detection
+    # ---------------------------------
 
-    # ----------------------------- #
-    # 🏆 TOP PARTICIPATING STUDENTS
-    # ----------------------------- #
-    st.subheader("🏆 Top Participating Students")
+    name_col = find_column(df, ["name"])
+    lead_score_col = find_column(df, ["lead score", "score", "engagement score"])
+    conversion_col = find_column(df, ["conversion", "status", "admitted", "paid"])
+    batch_col = find_column(df, ["batch"])
+    country_col = find_column(df, ["country"])
 
-    cols = ["Student Name", "Total Participation"]
-    if conversion_col:
-        cols.append(conversion_col)
+    if not name_col:
+        st.error("❌ No student name column detected.")
+        return
 
-    top_students = df.sort_values("Total Participation", ascending=False)[cols].head(25)
-    st.dataframe(top_students, use_container_width=True)
+    df = df.rename(columns={name_col: "Student Name"})
 
-    # ----------------------------- #
-    # 💰 PAYMENT & CONVERSION
-    # ----------------------------- #
-    st.subheader("💰 Payment & Conversion Analysis")
+    # ---------------------------------
+    # Event Columns Detection
+    # ---------------------------------
 
-    col1, col2, col3 = st.columns(3)
-    col1.metric("✅ Paid / Admitted", len(conv_metrics["paid_students"]))
-    col2.metric("🟡 Will Pay", len(conv_metrics["will_pay_students"]))
-    col3.metric("🔴 Not Paid", len(conv_metrics["not_paid_students"]))
-    st.metric("📈 Conversion Rate (%)", round(conv_metrics["conversion_rate"], 2))
-
-    if not conv_metrics["paid_students"].empty:
-        st.write("✅ Paid / Admitted Students")
-        st.dataframe(conv_metrics["paid_students"][["Student Name", "Conversion Status Clean"]],
-                     use_container_width=True)
-
-    if not conv_metrics["will_pay_students"].empty:
-        st.write("🟡 Will Pay Students")
-        st.dataframe(conv_metrics["will_pay_students"][["Student Name", "Conversion Status Clean"]],
-                     use_container_width=True)
-
-    # ----------------------------- #
-    # 🔁 RETENTION
-    # ----------------------------- #
-    st.subheader("🔁 Retention Analysis")
-
-    if payment_date_col:
-        st.metric("🔄 Retention Rate (%)", round(conv_metrics["retention_rate"], 2))
-        if conv_metrics["retained_students"]:
-            st.write("🎯 Retained Students:")
-            st.write(conv_metrics["retained_students"])
-        else:
-            st.info("No retained students detected yet.")
-    else:
-        st.info("Retention not calculated for this sheet (no payment date column).")
-
-    # ----------------------------- #
-    # ❌ NO PARTICIPATION STUDENTS
-    # ----------------------------- #
-    st.subheader("❌ Students With NO Event Participation")
-
-    no_participants = df[df["Total Participation"] == 0]
-    cols = ["Student Name"]
-    if conversion_col:
-        cols.append(conversion_col)
-    if payment_date_col:
-        cols.append(payment_date_col)
-
-    if not no_participants.empty:
-        st.dataframe(no_participants[cols], use_container_width=True)
-    else:
-        st.success("🎉 All students have participated in at least one event.")
-
-    # ----------------------------- #
-    # ⚠️ PAID BUT LOW ENGAGEMENT
-    # ----------------------------- #
-    st.subheader("⚠️ Paid Students With Low / No Engagement")
-
-    low_engagement_paid = conv_metrics["paid_students"][
-        conv_metrics["paid_students"]["Total Participation"] <= 1
+    exclude_keywords = [
+        "name", "email", "mobile", "country", "income", "batch",
+        "status", "exit", "engagement", "conversion", "lead", "score", "added"
     ]
 
-    cols = ["Student Name", "Total Participation"]
-    if payment_date_col:
-        cols.append(payment_date_col)
+    event_cols = [
+        col for col in df.columns
+        if not any(k in col.lower() for k in exclude_keywords)
+    ]
 
-    if not low_engagement_paid.empty:
-        st.dataframe(low_engagement_paid[cols], use_container_width=True)
+    if not event_cols:
+        st.error("❌ No event/participation columns detected.")
+        return
+
+    # Normalize event participation
+    df[event_cols] = df[event_cols].apply(normalize_yes_no)
+
+    # Total participation score
+    df["Total Participation"] = df[event_cols].sum(axis=1)
+
+    # ---------------------------------
+    # Lead Score + Conversion Handling
+    # ---------------------------------
+
+    if lead_score_col:
+        df["Lead Score"] = pd.to_numeric(df[lead_score_col], errors="coerce").fillna(0).astype(int)
     else:
-        st.success("👏 No paid students with low engagement!")
+        df["Lead Score"] = 0
 
-    # ----------------------------- #
-    # 📊 EVENT PARTICIPATION
-    # ----------------------------- #
-    st.subheader("📊 Event-wise Participation")
-
-    if not event_participation.empty:
-        fig, ax = plt.subplots(figsize=(10, 5))
-        ax.bar(event_participation["Event"], event_participation["Participants"])
-        ax.set_xticks(range(len(event_participation)))
-        ax.set_xticklabels(event_names[:len(event_participation)], rotation=45, ha="right")
-        ax.set_ylabel("Participants")
-        ax.set_title("Event Participation Count")
-        st.pyplot(fig)
+    if conversion_col:
+        df["Conversion Status"] = df[conversion_col].astype(str)
     else:
-        st.info("No event participation data detected.")
+        df["Conversion Status"] = "Unknown"
 
-    # ----------------------------- #
-    # 📈 PER-STUDENT TIMELINE
-    # ----------------------------- #
-    st.subheader("📈 Per-Student Participation Timeline")
+    paid_mask = df["Conversion Status"].str.lower().str.contains("paid|admitted|will pay", na=False)
+    df["Converted"] = paid_mask
 
-    student_choice = st.selectbox("Select Student", df["Student Name"].dropna().unique())
-    plot_student_timeline(df, event_cols, event_names, student_choice, payment_date_col)
+    # ---------------------------------
+    # KPI SECTION
+    # ---------------------------------
 
-    # ----------------------------- #
-    # 📋 RAW DATA VIEW
-    # ----------------------------- #
-    with st.expander("📋 View Cleaned Data"):
-        st.dataframe(df, use_container_width=True)
+    st.subheader("📌 Key Performance Indicators")
+
+    total_students = len(df)
+    active_students = (df["Total Participation"] > 0).sum()
+    converted_students = df["Converted"].sum()
+    avg_participation = round(df["Total Participation"].mean(), 2)
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Students", total_students)
+    col2.metric("Active Students", active_students)
+    col3.metric("Converted / Will Pay", converted_students)
+    col4.metric("Avg Participation Score", avg_participation)
+
+    # ---------------------------------
+    # 🔥 SECTION 1 — Top → Bottom Participating Students
+    # ---------------------------------
+
+    st.subheader("🏆 Student Participation Leaderboard")
+
+    leaderboard_cols = ["Student Name", "Total Participation", "Lead Score", "Conversion Status"]
+    leaderboard_df = df[leaderboard_cols].sort_values(by="Total Participation", ascending=False)
+
+    st.dataframe(leaderboard_df, use_container_width=True)
+
+    # ---------------------------------
+    # 📊 SECTION 2 — Event Participation Summary
+    # ---------------------------------
+
+    st.subheader("📅 Event Participation Summary")
+
+    event_participation = (
+        df[event_cols]
+        .sum()
+        .reset_index()
+        .rename(columns={"index": "Event", 0: "Participants"})
+        .sort_values(by="Participants", ascending=False)
+    )
+
+    st.dataframe(event_participation, use_container_width=True)
+
+    # Bar Chart
+    fig1, ax1 = plt.subplots()
+    ax1.bar(event_participation["Event"], event_participation["Participants"])
+    ax1.set_title("Event-wise Participation Count")
+    ax1.set_xlabel("Event")
+    ax1.set_ylabel("Participants")
+    plt.xticks(rotation=45, ha="right")
+    st.pyplot(fig1)
+
+    # ---------------------------------
+    # 📈 SECTION 3 — Participation Distribution
+    # ---------------------------------
+
+    st.subheader("📈 Participation Distribution")
+
+    fig2, ax2 = plt.subplots()
+    ax2.hist(df["Total Participation"], bins=10)
+    ax2.set_title("Distribution of Student Participation Scores")
+    ax2.set_xlabel("Participation Score")
+    ax2.set_ylabel("Number of Students")
+    st.pyplot(fig2)
+
+    # ---------------------------------
+    # 🎯 SECTION 4 — Conversion Analysis
+    # ---------------------------------
+
+    st.subheader("🎯 Conversion Analysis")
+
+    conversion_summary = (
+        df.groupby("Converted")["Student Name"]
+        .count()
+        .reset_index()
+        .replace({True: "Converted / Will Pay", False: "Not Converted"})
+        .rename(columns={"Student Name": "Students"})
+    )
+
+    st.dataframe(conversion_summary, use_container_width=True)
+
+    fig3, ax3 = plt.subplots()
+    ax3.bar(conversion_summary["Converted"], conversion_summary["Students"])
+    ax3.set_title("Conversion Status Distribution")
+    ax3.set_xlabel("Status")
+    ax3.set_ylabel("Students")
+    st.pyplot(fig3)
+
+    # ---------------------------------
+    # 🧠 SECTION 5 — Participation vs Conversion
+    # ---------------------------------
+
+    st.subheader("🧠 Participation vs Conversion Insight")
+
+    conversion_by_participation = (
+        df.groupby("Total Participation")["Converted"]
+        .mean()
+        .reset_index()
+        .rename(columns={"Converted": "Conversion Rate"})
+    )
+
+    fig4, ax4 = plt.subplots()
+    ax4.plot(conversion_by_participation["Total Participation"],
+             conversion_by_participation["Conversion Rate"], marker="o")
+    ax4.set_title("Conversion Rate vs Participation Score")
+    ax4.set_xlabel("Participation Score")
+    ax4.set_ylabel("Conversion Rate")
+    st.pyplot(fig4)
+
+    # ---------------------------------
+    # 🌍 SECTION 6 — Country-wise Engagement (if available)
+    # ---------------------------------
+
+    if country_col:
+        st.subheader("🌍 Country-wise Engagement")
+
+        country_engagement = (
+            df.groupby(country_col)["Total Participation"]
+            .mean()
+            .reset_index()
+            .rename(columns={country_col: "Country", "Total Participation": "Avg Participation"})
+            .sort_values(by="Avg Participation", ascending=False)
+        )
+
+        st.dataframe(country_engagement, use_container_width=True)
+
+        fig5, ax5 = plt.subplots()
+        ax5.bar(country_engagement["Country"], country_engagement["Avg Participation"])
+        ax5.set_title("Average Participation by Country")
+        ax5.set_xlabel("Country")
+        ax5.set_ylabel("Avg Participation")
+        plt.xticks(rotation=45, ha="right")
+        st.pyplot(fig5)
+
+    # ---------------------------------
+    # 📦 SECTION 7 — Downloads
+    # ---------------------------------
+
+    st.subheader("⬇️ Download Reports")
+
+    st.download_button(
+        "Download Student Leaderboard",
+        leaderboard_df.to_csv(index=False),
+        file_name="student_participation_leaderboard.csv",
+        mime="text/csv"
+    )
+
+    st.download_button(
+        "Download Event Participation Report",
+        event_participation.to_csv(index=False),
+        file_name="event_participation_report.csv",
+        mime="text/csv"
+    )
+
+    st.download_button(
+        "Download Full Processed Dataset",
+        df.to_csv(index=False),
+        file_name="processed_engagement_dataset.csv",
+        mime="text/csv"
+    )
 
 
 if __name__ == "__main__":
