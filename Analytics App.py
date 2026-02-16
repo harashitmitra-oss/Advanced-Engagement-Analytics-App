@@ -41,6 +41,7 @@ def make_unique(cols):
 
 
 def normalize_binary(x) -> int:
+    # crash-proof for any weird cell values
     try:
         if x is None:
             return 0
@@ -79,7 +80,6 @@ def parse_event_date(val):
     if not s:
         return pd.NaT
 
-    # capture first dd mm yyyy anywhere
     m = re.search(r"(\d{1,2})\D+(\d{1,2})\D+(\d{4})", s)
     if not m:
         return pd.NaT
@@ -94,7 +94,7 @@ def parse_event_date(val):
 def best_matching_col(df: pd.DataFrame, keywords, hard_excludes=None):
     """
     If multiple columns match, pick the one with:
-      1) strongest keyword match (longer keyword hit)
+      1) strongest keyword hit (longer keyword)
       2) most non-null values
     """
     hard_excludes = hard_excludes or []
@@ -108,7 +108,6 @@ def best_matching_col(df: pd.DataFrame, keywords, hard_excludes=None):
         for k in keywords:
             if k in cl:
                 hit_strength = max(hit_strength, len(k))
-
         if hit_strength > 0:
             scored.append((c, hit_strength, df[c].notna().sum()))
 
@@ -126,18 +125,31 @@ def row_is_numeric_only(r):
     return all(re.fullmatch(r"\d+(\.\d+)?", v) for v in vals)
 
 
+def is_probably_event_col(series: pd.Series) -> bool:
+    """
+    Keep only columns that look like attendance (yes/no/1/0/attended etc).
+    Helps align across inconsistent sheets.
+    """
+    s = series.dropna().astype(str).str.strip().str.lower()
+    if s.empty:
+        return False
+    allowed = {"yes", "no", "y", "n", "true", "false", "1", "0", "attended", "present", "absent", ""}
+    frac = (s.isin(allowed)).mean()
+    return frac >= 0.5
+
+
 # =========================
-# Sheet-aware loader
+# Sheet-aware loader (ROBUST)
 # =========================
 def load_sheet_structured(raw: pd.DataFrame):
     """
-    Deterministic for your workbook:
-    - Header row = first row (top ~30) containing 'Student Name' or 'Student Names'
-    - Date row   = header_row - 1
-    - Event row  = header_row - 2
+    Robust across your workbook (including PG - B3 & B4):
+    - Header row = first row (top ~40) containing 'Student Name' or 'Student Names'
+    - Date row   = the row ABOVE header with the MOST parseable dates (search up to 6 rows)
+    - Event row  = date_row - 1 (event names)
     """
     header_row = None
-    for i in range(min(30, len(raw))):
+    for i in range(min(40, len(raw))):
         row_text = " | ".join([clean_text(v).lower() for v in raw.iloc[i, :].tolist()])
         if "student name" in row_text or "student names" in row_text:
             header_row = i
@@ -146,8 +158,28 @@ def load_sheet_structured(raw: pd.DataFrame):
     if header_row is None:
         return None, None, "Could not find 'Student Name(s)' header row in top rows."
 
-    date_row = header_row - 1 if header_row - 1 >= 0 else None
-    event_row = header_row - 2 if header_row - 2 >= 0 else None
+    # ---- find best date row above header_row ----
+    candidate_rows = list(range(max(0, header_row - 6), header_row))
+    best_date_row = None
+    best_date_hits = -1
+
+    for r in candidate_rows:
+        cells = raw.iloc[r, :].tolist()
+        hits = 0
+        for v in cells:
+            if pd.notna(parse_event_date(v)):
+                hits += 1
+        if hits > best_date_hits:
+            best_date_hits = hits
+            best_date_row = r
+
+    # If we found at least a few dates, accept; else fallback to old offset
+    if best_date_row is not None and best_date_hits >= 3:
+        date_row = best_date_row
+        event_row = date_row - 1 if date_row - 1 >= 0 else None
+    else:
+        date_row = header_row - 1 if header_row - 1 >= 0 else None
+        event_row = header_row - 2 if header_row - 2 >= 0 else None
 
     header_cells = [clean_text(x) for x in raw.iloc[header_row, :].tolist()]
     event_cells = (
@@ -156,6 +188,7 @@ def load_sheet_structured(raw: pd.DataFrame):
         else [""] * len(header_cells)
     )
 
+    # Build columns:
     cols = []
     for j, h in enumerate(header_cells):
         if h:
@@ -169,10 +202,9 @@ def load_sheet_structured(raw: pd.DataFrame):
     df = raw.iloc[header_row + 1 :, :].copy()
     df.columns = cols
     df = df.reset_index(drop=True)
-
-    # Drop only fully-empty rows here; summary-like row dropping is safer AFTER we know name_col
     df = df.dropna(how="all")
 
+    # Event-date mapping from date_row
     event_dates = {}
     if date_row is not None:
         date_cells = raw.iloc[date_row, :].tolist()
@@ -187,6 +219,7 @@ def load_sheet_structured(raw: pd.DataFrame):
         "event_row": event_row,
         "date_row": date_row,
         "event_dates": event_dates,
+        "date_hits": best_date_hits if best_date_hits >= 0 else None,
     }
     return df, meta, None
 
@@ -212,15 +245,13 @@ if not uploaded_file:
     st.stop()
 
 file_bytes = uploaded_file.getvalue()
-
 all_sheets = get_sheet_names(file_bytes)
 
-# ✅ Ignore first 2 sheets as requested
+# ✅ Ignore first 2 sheets
 sheets = all_sheets[2:] if len(all_sheets) > 2 else all_sheets
 selected_sheet = st.sidebar.selectbox("Select Sheet (first 2 sheets ignored)", sheets)
 
 raw = read_raw_sheet(file_bytes, selected_sheet)
-
 df, meta, err = load_sheet_structured(raw)
 if err:
     st.error(f"❌ {err}")
@@ -228,10 +259,8 @@ if err:
 
 # Keyword maps for metadata
 KW = {
-    # Safer: avoid super-broad "name" matching unless nothing else found
     "name_strict": ["student name", "student names", "full name", "learner name"],
     "name_fallback": ["name"],
-
     "email": ["email", "e mail", "e-mail"],
     "phone": ["phone", "mobile", "mobile no", "phone number"],
     "country": ["country"],
@@ -246,8 +275,10 @@ KW = {
 # Detect metadata columns (choose best if duplicates exist)
 name_col = best_matching_col(df, KW["name_strict"])
 if not name_col:
-    # fallback, but avoid "batch name"/etc if present
-    name_col = best_matching_col(df, KW["name_fallback"], hard_excludes=["batch", "program", "session", "event"])
+    name_col = best_matching_col(
+        df, KW["name_fallback"],
+        hard_excludes=["batch", "program", "session", "event", "country", "status"]
+    )
 
 email_col = best_matching_col(df, KW["email"])
 phone_col = best_matching_col(df, KW["phone"])
@@ -263,8 +294,8 @@ if not name_col:
     st.error("❌ Student Name column not detected after parsing.")
     st.stop()
 
-# ✅ Now safely drop summary-like numeric rows only when name is blank
-name_series = df[name_col].astype(str).map(lambda x: clean_text(x))
+# Safer summary-row dropping: only drop numeric-only rows when name is blank
+name_series = df[name_col].astype(str).map(clean_text)
 numeric_mask = df.apply(row_is_numeric_only, axis=1)
 blank_name_mask = name_series.map(lambda x: x == "" or x.lower() == "nan")
 df = df.loc[~(numeric_mask & blank_name_mask)].copy()
@@ -279,6 +310,9 @@ metadata_cols = {
     if c
 }
 event_cols = [c for c in df.columns if c not in metadata_cols]
+
+# Keep only columns that look like attendance (helps align across sheets)
+event_cols = [c for c in event_cols if is_probably_event_col(df[c])]
 
 # Normalize event columns
 for c in event_cols:
@@ -298,7 +332,6 @@ if not conversion_col:
 df[conversion_col] = df[conversion_col].astype(str).map(lambda x: clean_text(x).lower())
 
 # Paid definition:
-# Paid/Admitted if payment date exists OR conversion contains admitted/paid
 def conv_category(r):
     if payment_col and pd.notna(r.get(payment_col, pd.NaT)):
         return "Paid / Admitted"
@@ -370,7 +403,12 @@ conv_filter = st.sidebar.multiselect(
     default=["Paid / Admitted", "Will Pay", "Not Paid"],
 )
 
-min_part = st.sidebar.slider("Minimum participation count", 0, int(df["participation_count"].max() or 0), 0)
+min_part = st.sidebar.slider(
+    "Minimum participation count",
+    0,
+    int(df["participation_count"].max() or 0),
+    0
+)
 
 batch_filter = None
 if batch_col:
@@ -404,7 +442,6 @@ paid_count = int((df["conversion_category"] == "Paid / Admitted").sum())
 participants = int((df["participation_count"] > 0).sum())
 conversion_rate = (paid_count / participants * 100) if participants else 0.0
 
-# filtered metrics
 f_total = int(fdf[name_col].notna().sum())
 f_active = int((fdf["participation_count"] > 0).sum())
 f_paid = int((fdf["conversion_category"] == "Paid / Admitted").sum())
@@ -412,12 +449,15 @@ f_participants = int((fdf["participation_count"] > 0).sum())
 f_conv_rate = (f_paid / f_participants * 100) if f_participants else 0.0
 
 st.caption(
-    f"Parsed '{selected_sheet}' using: header_row={meta['header_row']}, event_row={meta['event_row']}, date_row={meta['date_row']} | "
+    f"Parsed '{selected_sheet}' using: header_row={meta['header_row']}, "
+    f"event_row={meta['event_row']}, date_row={meta['date_row']} | "
     f"Detected events: {len(event_cols)} | Rows: {len(df)}"
 )
 
 if payment_col and not event_dates:
-    st.warning("Retention: this sheet has Payment Date but no event dates parsed → retention falls back to “any participation after payment (unknown)”. Interpret carefully.")
+    st.warning(
+        "Retention: this sheet has Payment Date but no event dates parsed → retention falls back to “any participation”."
+    )
 
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Total Students (All)", total_students, f"Filtered: {f_total}")
@@ -426,9 +466,13 @@ m3.metric("Paid / Admitted (All)", paid_count, f"Filtered: {f_paid}")
 m4.metric("Conversion Rate (All)", f"{conversion_rate:.1f}%", f"Filtered: {f_conv_rate:.1f}%")
 m5.metric("Retention Rate", f"{(retention_rate or 0):.1f}%" if payment_col else "N/A")
 
-# Download filtered view
 csv = fdf.to_csv(index=False).encode("utf-8")
-st.download_button("⬇️ Download filtered data (CSV)", data=csv, file_name=f"{selected_sheet}_filtered.csv", mime="text/csv")
+st.download_button(
+    "⬇️ Download filtered data (CSV)",
+    data=csv,
+    file_name=f"{selected_sheet}_filtered.csv",
+    mime="text/csv",
+)
 
 st.divider()
 
@@ -441,7 +485,7 @@ st.dataframe(
         [name_col, "participation_count", "conversion_category", "lead_score"]
     ].head(100),
     use_container_width=True,
-    height=360
+    height=360,
 )
 
 # =========================
@@ -477,7 +521,7 @@ st.dataframe(raw_conv_counts, use_container_width=True, height=240)
 # =========================
 # 3️⃣ Retention
 # =========================
-st.header("3️⃣ Retention Analysis (PG sheets) (Filtered)")
+st.header("3️⃣ Retention Analysis (Filtered)")
 if payment_col:
     f_ret = float(fdf["retained"].mean() * 100) if len(fdf) else 0.0
     st.metric("Retention Rate (Filtered)", f"{f_ret:.2f}%")
@@ -485,7 +529,7 @@ if payment_col:
     st.subheader("Retained Students (paid + attended after payment date)")
     st.dataframe(retained, use_container_width=True, height=280)
 else:
-    st.info("Retention analysis not available for this sheet (no Payment Date column detected).")
+    st.info("Retention analysis not available (no Payment Date column detected).")
 
 # =========================
 # 4️⃣ No participation
@@ -521,11 +565,13 @@ else:
     event_counts = fdf[event_cols].sum().sort_values(ascending=False)
     event_pct = (event_counts / max(len(fdf), 1) * 100).round(1)
 
-    event_table = pd.DataFrame({
-        "Event": event_counts.index,
-        "Participants": event_counts.values.astype(int),
-        "Participation %": event_pct.values
-    })
+    event_table = pd.DataFrame(
+        {
+            "Event": event_counts.index,
+            "Participants": event_counts.values.astype(int),
+            "Participation %": event_pct.values,
+        }
+    )
     st.dataframe(event_table, use_container_width=True, height=320)
 
     fig_bar = px.bar(event_table, x="Event", y="Participants", hover_data=["Participation %"])
@@ -537,8 +583,8 @@ else:
     min_n = 1 if n_events < 5 else 5
     max_n = max(min(25, n_events), min_n)
     default_n = min(12, max_n)
-
     top_n = st.slider("Pie chart: number of top events", min_n, max_n, default_n)
+
     pie_df = event_table.head(top_n).copy()
     fig_pie = px.pie(pie_df, names="Event", values="Participants", hole=0.35)
     fig_pie.update_layout(height=420, margin=dict(l=10, r=10, t=40, b=10))
@@ -549,15 +595,13 @@ else:
 # =========================
 st.header("6b️⃣ Participation Trend Over Time")
 if event_dates:
-    # build a date->count series across events
-    dmap = {ev: event_dates.get(ev, pd.NaT) for ev in event_cols}
-    dated_events = [(ev, dt) for ev, dt in dmap.items() if pd.notna(dt)]
+    dated_events = [(ev, event_dates.get(ev, pd.NaT)) for ev in event_cols]
+    dated_events = [(ev, dt) for ev, dt in dated_events if pd.notna(dt)]
     if dated_events:
-        trend = []
-        for ev, dt in dated_events:
-            trend.append((dt, int(fdf[ev].sum())))
+        trend = [(dt, int(fdf[ev].sum())) for ev, dt in dated_events]
         trend_df = pd.DataFrame(trend, columns=["Event Date", "Participants"]).groupby("Event Date", as_index=False).sum()
         trend_df = trend_df.sort_values("Event Date")
+
         fig_tr = px.line(trend_df, x="Event Date", y="Participants", markers=True)
         fig_tr.update_layout(height=360, margin=dict(l=10, r=10, t=40, b=10))
         st.plotly_chart(fig_tr, use_container_width=True)
@@ -567,7 +611,7 @@ else:
     st.info("No event dates detected in this sheet.")
 
 # =========================
-# 7️⃣ Per-student timeline
+# 7️⃣ Per-student timeline (FULL RANGE from 1st to last event date)
 # =========================
 st.header("7️⃣ Per-Student Participation Timeline (Filtered)")
 
@@ -579,13 +623,15 @@ else:
     row = fdf[fdf[name_col].astype(str) == str(selected_student)].iloc[0]
 
     timeline_events = event_cols[:]
-    if event_dates:
+    use_dates = bool(event_dates)
+
+    if use_dates:
+        # Keep order by date (events without dates go last)
         timeline_events = sorted(
             timeline_events,
             key=lambda ev: (pd.isna(event_dates.get(ev, pd.NaT)), event_dates.get(ev, pd.NaT)),
         )
 
-    use_dates = bool(event_dates)
     x_vals, x_labels, attended = [], [], []
     for i, ev in enumerate(timeline_events, start=1):
         if use_dates and pd.notna(event_dates.get(ev, pd.NaT)):
@@ -595,13 +641,14 @@ else:
         x_labels.append(ev)
         attended.append(int(row.get(ev, 0)))
 
-    y_line = [1 if a == 1 else None for a in attended]
+    y_line = [1 if a == 1 else None for a in attended]  # breaks on misses
     y_miss = [0 if a == 0 else None for a in attended]
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=x_vals, y=y_line, mode="lines+markers", name="Attended", connectgaps=False))
     fig.add_trace(go.Scatter(x=x_vals, y=y_miss, mode="markers", name="Missed", marker=dict(symbol="x", size=9)))
 
+    # Payment marker
     if payment_col and pd.notna(row.get(payment_col, pd.NaT)):
         pay_dt = row[payment_col]
         if use_dates:
@@ -626,6 +673,15 @@ else:
         showlegend=True
     )
 
+    # ✅ Force x-axis to span from first event date to last event date
+    if use_dates:
+        dated = [event_dates.get(ev, pd.NaT) for ev in timeline_events]
+        dated = [d for d in dated if pd.notna(d)]
+        if dated:
+            min_dt = min(dated)
+            max_dt = max(dated)
+            fig.update_xaxes(range=[min_dt, max_dt])
+
     if not use_dates:
         fig.update_xaxes(
             tickmode="array",
@@ -645,5 +701,5 @@ st.dataframe(
         [name_col, "lead_score", "participation_count", "conversion_category"]
     ].head(100),
     use_container_width=True,
-    height=360
+    height=360,
 )
