@@ -41,7 +41,6 @@ def make_unique(cols):
 
 
 def normalize_binary(x) -> int:
-    # crash-proof for any weird cell values
     try:
         if x is None:
             return 0
@@ -92,11 +91,6 @@ def parse_event_date(val):
 
 
 def best_matching_col(df: pd.DataFrame, keywords, hard_excludes=None):
-    """
-    If multiple columns match, pick the one with:
-      1) strongest keyword hit (longer keyword)
-      2) most non-null values
-    """
     hard_excludes = hard_excludes or []
     scored = []
     for c in df.columns:
@@ -126,16 +120,31 @@ def row_is_numeric_only(r):
 
 
 def is_probably_event_col(series: pd.Series) -> bool:
-    """
-    Keep only columns that look like attendance (yes/no/1/0/attended etc).
-    Helps align across inconsistent sheets.
-    """
     s = series.dropna().astype(str).str.strip().str.lower()
     if s.empty:
         return False
     allowed = {"yes", "no", "y", "n", "true", "false", "1", "0", "attended", "present", "absent", ""}
     frac = (s.isin(allowed)).mean()
     return frac >= 0.5
+
+
+def safe_datetime_range_with_padding(dates, pad_days=2):
+    """
+    Ensures all points are visible on plotly date axes by adding padding on both ends.
+    Handles edge cases where min==max.
+    """
+    dates = [d for d in dates if pd.notna(d)]
+    if not dates:
+        return None
+    mn = min(dates)
+    mx = max(dates)
+    if mn == mx:
+        mn = mn - pd.Timedelta(days=pad_days)
+        mx = mx + pd.Timedelta(days=pad_days)
+    else:
+        mn = mn - pd.Timedelta(days=pad_days)
+        mx = mx + pd.Timedelta(days=pad_days)
+    return [mn, mx]
 
 
 # =========================
@@ -158,7 +167,6 @@ def load_sheet_structured(raw: pd.DataFrame):
     if header_row is None:
         return None, None, "Could not find 'Student Name(s)' header row in top rows."
 
-    # ---- find best date row above header_row ----
     candidate_rows = list(range(max(0, header_row - 6), header_row))
     best_date_row = None
     best_date_hits = -1
@@ -173,7 +181,6 @@ def load_sheet_structured(raw: pd.DataFrame):
             best_date_hits = hits
             best_date_row = r
 
-    # If we found at least a few dates, accept; else fallback to old offset
     if best_date_row is not None and best_date_hits >= 3:
         date_row = best_date_row
         event_row = date_row - 1 if date_row - 1 >= 0 else None
@@ -188,7 +195,6 @@ def load_sheet_structured(raw: pd.DataFrame):
         else [""] * len(header_cells)
     )
 
-    # Build columns:
     cols = []
     for j, h in enumerate(header_cells):
         if h:
@@ -204,7 +210,6 @@ def load_sheet_structured(raw: pd.DataFrame):
     df = df.reset_index(drop=True)
     df = df.dropna(how="all")
 
-    # Event-date mapping from date_row
     event_dates = {}
     if date_row is not None:
         date_cells = raw.iloc[date_row, :].tolist()
@@ -272,7 +277,7 @@ KW = {
     "date_of_exit": ["date of exit"],
 }
 
-# Detect metadata columns (choose best if duplicates exist)
+# Detect metadata columns
 name_col = best_matching_col(df, KW["name_strict"])
 if not name_col:
     name_col = best_matching_col(
@@ -311,7 +316,7 @@ metadata_cols = {
 }
 event_cols = [c for c in df.columns if c not in metadata_cols]
 
-# Keep only columns that look like attendance (helps align across sheets)
+# Keep only columns that look like attendance
 event_cols = [c for c in event_cols if is_probably_event_col(df[c])]
 
 # Normalize event columns
@@ -331,7 +336,7 @@ if not conversion_col:
     conversion_col = "Conversion Status"
 df[conversion_col] = df[conversion_col].astype(str).map(lambda x: clean_text(x).lower())
 
-# Paid definition:
+# Paid definition
 def conv_category(r):
     if payment_col and pd.notna(r.get(payment_col, pd.NaT)):
         return "Paid / Admitted"
@@ -344,7 +349,7 @@ def conv_category(r):
 
 df["conversion_category"] = df.apply(conv_category, axis=1)
 
-# Retention: paid + attended an event whose date > payment date
+# Retention
 event_dates = meta.get("event_dates", {}) or {}
 
 def retained_flag(r):
@@ -354,7 +359,6 @@ def retained_flag(r):
     if pd.isna(pay):
         return 0
 
-    # If we have no event dates for this sheet, fallback to any participation (but warn in UI)
     if not event_dates:
         return 1 if r.get("participation_count", 0) > 0 else 0
 
@@ -393,7 +397,7 @@ def lead_score(r):
 df["lead_score"] = df.apply(lead_score, axis=1)
 
 # =========================
-# Sidebar filters (dashboard upgrade)
+# Sidebar filters
 # =========================
 st.sidebar.markdown("### Filters")
 
@@ -455,9 +459,7 @@ st.caption(
 )
 
 if payment_col and not event_dates:
-    st.warning(
-        "Retention: this sheet has Payment Date but no event dates parsed → retention falls back to “any participation”."
-    )
+    st.warning("Retention: Payment Date exists but event dates were not parsed → retention falls back to “any participation”.")
 
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Total Students (All)", total_students, f"Filtered: {f_total}")
@@ -531,6 +533,120 @@ if payment_col:
 else:
     st.info("Retention analysis not available (no Payment Date column detected).")
 
+st.divider()
+
+# =========================
+# 📈 Upgrades: Payment & Participation Insights
+# =========================
+st.header("📈 Payment & Participation Insights")
+
+# A) Participation vs Lead Score (colored by conversion)
+if len(fdf) > 0:
+    st.subheader("A) Participation vs Lead Score (Filtered)")
+    fig_sc = px.scatter(
+        fdf,
+        x="participation_count",
+        y="lead_score",
+        color="conversion_category",
+        hover_data=[name_col] + ([payment_col] if payment_col else []),
+        title="Lead Score vs Participation (color = conversion category)",
+    )
+    fig_sc.update_layout(height=420, margin=dict(l=10, r=10, t=60, b=10))
+    st.plotly_chart(fig_sc, use_container_width=True)
+else:
+    st.info("No rows available in the filtered view for plotting.")
+
+# B) Engagement around Payment Date (before/after), requires payment_col + event_dates
+if payment_col and event_dates and event_cols and len(fdf) > 0:
+    st.subheader("B) Engagement Before vs After Payment Date (Filtered)")
+
+    rows = []
+    for _, r in fdf.iterrows():
+        pay = r.get(payment_col, pd.NaT)
+        if pd.isna(pay):
+            continue
+        pay = pay.normalize()
+        for ev in event_cols:
+            ev_dt = event_dates.get(ev, pd.NaT)
+            if pd.isna(ev_dt):
+                continue
+            rows.append(
+                {
+                    "Student": str(r.get(name_col, "")),
+                    "Payment Date": pay,
+                    "Event": ev,
+                    "Event Date": ev_dt,
+                    "Attended": int(r.get(ev, 0)),
+                    "Days From Payment": int((ev_dt - pay).days),
+                }
+            )
+
+    long_df = pd.DataFrame(rows)
+    if long_df.empty:
+        st.info("Not enough data to compute engagement around payment date for this sheet.")
+    else:
+        min_d, max_d = int(long_df["Days From Payment"].min()), int(long_df["Days From Payment"].max())
+        left = max(-60, min_d)
+        right = min(60, max_d)
+
+        window = st.slider(
+            "Window (days relative to payment date)",
+            min_value=left,
+            max_value=right,
+            value=(-14, 30),
+        )
+
+        wdf = long_df[(long_df["Days From Payment"] >= window[0]) & (long_df["Days From Payment"] <= window[1])]
+
+        agg = (
+            wdf.groupby("Days From Payment", as_index=False)
+            .agg(Attended=("Attended", "sum"), Events=("Attended", "count"))
+        )
+        agg["Attendance Rate"] = (agg["Attended"] / agg["Events"]).fillna(0.0)
+
+        fig_pay = px.line(
+            agg,
+            x="Days From Payment",
+            y="Attendance Rate",
+            markers=True,
+            hover_data=["Attended", "Events"],
+            title="Attendance Rate vs Days From Payment Date",
+        )
+        fig_pay.add_vline(x=0, line_dash="dash")
+        fig_pay.update_layout(height=420, margin=dict(l=10, r=10, t=60, b=10))
+        st.plotly_chart(fig_pay, use_container_width=True)
+
+        st.caption("Day 0 = payment date. Positive days = events after payment.")
+else:
+    st.info("Engagement around payment date requires both Payment Date and Event Dates for this sheet.")
+
+# C) Quick action lists
+if len(fdf) > 0:
+    st.subheader("C) Quick Action Lists (Filtered)")
+    colA, colB = st.columns(2)
+
+    with colA:
+        st.markdown("**High engagement but not paid** (best conversion targets)")
+        targets = (
+            fdf[(fdf["conversion_category"] != "Paid / Admitted") & (fdf["participation_count"] >= 3)]
+            .sort_values(["participation_count", "lead_score"], ascending=False)
+            [[name_col, "participation_count", "lead_score", "conversion_category"]]
+            .head(15)
+        )
+        st.dataframe(targets, use_container_width=True, height=320)
+
+    with colB:
+        st.markdown("**Paid but low engagement** (retention risk)")
+        risks = (
+            fdf[(fdf["conversion_category"] == "Paid / Admitted") & (fdf["participation_count"] <= 1)]
+            .sort_values(["participation_count", "lead_score"], ascending=True)
+            [[name_col, "participation_count", "lead_score"]]
+            .head(15)
+        )
+        st.dataframe(risks, use_container_width=True, height=320)
+
+st.divider()
+
 # =========================
 # 4️⃣ No participation
 # =========================
@@ -578,7 +694,7 @@ else:
     fig_bar.update_layout(xaxis_tickangle=-45, height=420, margin=dict(l=10, r=10, t=40, b=120))
     st.plotly_chart(fig_bar, use_container_width=True)
 
-    # ✅ FIXED slider: never invalid range
+    # Slider safe even for small #events
     n_events = len(event_table)
     min_n = 1 if n_events < 5 else 5
     max_n = max(min(25, n_events), min_n)
@@ -594,7 +710,7 @@ else:
 # 6b️⃣ Participation trend over time (if event dates exist)
 # =========================
 st.header("6b️⃣ Participation Trend Over Time")
-if event_dates:
+if event_dates and event_cols:
     dated_events = [(ev, event_dates.get(ev, pd.NaT)) for ev in event_cols]
     dated_events = [(ev, dt) for ev, dt in dated_events if pd.notna(dt)]
     if dated_events:
@@ -603,6 +719,10 @@ if event_dates:
         trend_df = trend_df.sort_values("Event Date")
 
         fig_tr = px.line(trend_df, x="Event Date", y="Participants", markers=True)
+        # Force full range visible
+        rng = safe_datetime_range_with_padding(trend_df["Event Date"].tolist(), pad_days=2)
+        if rng:
+            fig_tr.update_xaxes(range=rng)
         fig_tr.update_layout(height=360, margin=dict(l=10, r=10, t=40, b=10))
         st.plotly_chart(fig_tr, use_container_width=True)
     else:
@@ -611,7 +731,7 @@ else:
     st.info("No event dates detected in this sheet.")
 
 # =========================
-# 7️⃣ Per-student timeline (FULL RANGE from 1st to last event date)
+# 7️⃣ Per-student timeline (better visibility + bold green payment marker)
 # =========================
 st.header("7️⃣ Per-Student Participation Timeline (Filtered)")
 
@@ -626,61 +746,103 @@ else:
     use_dates = bool(event_dates)
 
     if use_dates:
-        # Keep order by date (events without dates go last)
         timeline_events = sorted(
             timeline_events,
             key=lambda ev: (pd.isna(event_dates.get(ev, pd.NaT)), event_dates.get(ev, pd.NaT)),
         )
 
     x_vals, x_labels, attended = [], [], []
+    event_dt_list = []
     for i, ev in enumerate(timeline_events, start=1):
         if use_dates and pd.notna(event_dates.get(ev, pd.NaT)):
-            x_vals.append(event_dates[ev])
+            dt = event_dates[ev]
+            x_vals.append(dt)
+            event_dt_list.append(dt)
         else:
             x_vals.append(i)
         x_labels.append(ev)
         attended.append(int(row.get(ev, 0)))
 
-    y_line = [1 if a == 1 else None for a in attended]  # breaks on misses
-    y_miss = [0 if a == 0 else None for a in attended]
+    # Better visibility: split attended/missed markers so nothing "looks missing"
+    attended_x = []
+    attended_y = []
+    missed_x = []
+    missed_y = []
+
+    for xv, a in zip(x_vals, attended):
+        if a == 1:
+            attended_x.append(xv)
+            attended_y.append(1)
+        else:
+            missed_x.append(xv)
+            missed_y.append(0)
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=x_vals, y=y_line, mode="lines+markers", name="Attended", connectgaps=False))
-    fig.add_trace(go.Scatter(x=x_vals, y=y_miss, mode="markers", name="Missed", marker=dict(symbol="x", size=9)))
 
-    # Payment marker
+    # Draw a faint baseline to make reading easier
+    fig.add_trace(go.Scatter(
+        x=x_vals,
+        y=[0.5] * len(x_vals),
+        mode="lines",
+        name="",
+        hoverinfo="skip",
+        showlegend=False,
+        line=dict(width=1, dash="dot"),
+        opacity=0.25,
+    ))
+
+    # Attended markers (with connecting line through attended points only)
+    fig.add_trace(go.Scatter(
+        x=attended_x, y=attended_y,
+        mode="lines+markers",
+        name="Attended",
+        connectgaps=False
+    ))
+
+    # Missed markers
+    fig.add_trace(go.Scatter(
+        x=missed_x, y=missed_y,
+        mode="markers",
+        name="Missed",
+        marker=dict(symbol="x", size=10)
+    ))
+
+    # Payment marker: bold + green
     if payment_col and pd.notna(row.get(payment_col, pd.NaT)):
         pay_dt = row[payment_col]
         if use_dates:
             fig.add_trace(go.Scatter(
-                x=[pay_dt], y=[1.15], mode="markers+text",
-                text=["✔ Payment"], textposition="top center",
-                name="Payment Date", marker=dict(symbol="star", size=14)
+                x=[pay_dt], y=[1.18], mode="markers+text",
+                text=["<b>✔ Payment</b>"],
+                textposition="top center",
+                name="Payment Date",
+                marker=dict(symbol="star", size=16, color="green"),
+                textfont=dict(size=14, color="green"),
             ))
         else:
             fig.add_trace(go.Scatter(
-                x=[len(timeline_events) + 1], y=[1.15], mode="markers+text",
-                text=["✔ Payment"], textposition="top center",
-                name="Payment Date", marker=dict(symbol="star", size=14)
+                x=[len(timeline_events) + 1], y=[1.18], mode="markers+text",
+                text=["<b>✔ Payment</b>"],
+                textposition="top center",
+                name="Payment Date",
+                marker=dict(symbol="star", size=16, color="green"),
+                textfont=dict(size=14, color="green"),
             ))
 
     fig.update_yaxes(range=[-0.2, 1.3], tickvals=[0, 1], title="Participation (1=Attended, 0=Missed)")
     fig.update_layout(
-        height=520,
-        margin=dict(l=10, r=10, t=50, b=80),
+        height=560,
+        margin=dict(l=10, r=10, t=60, b=90),
         title=f"Timeline — {selected_student}",
         xaxis_title="Event Date" if use_dates else "Event Sequence",
         showlegend=True
     )
 
-    # ✅ Force x-axis to span from first event date to last event date
-    if use_dates:
-        dated = [event_dates.get(ev, pd.NaT) for ev in timeline_events]
-        dated = [d for d in dated if pd.notna(d)]
-        if dated:
-            min_dt = min(dated)
-            max_dt = max(dated)
-            fig.update_xaxes(range=[min_dt, max_dt])
+    # ✅ Make sure start/end events never get clipped (padding on both ends)
+    if use_dates and event_dt_list:
+        rng = safe_datetime_range_with_padding(event_dt_list, pad_days=3)
+        if rng:
+            fig.update_xaxes(range=rng)
 
     if not use_dates:
         fig.update_xaxes(
