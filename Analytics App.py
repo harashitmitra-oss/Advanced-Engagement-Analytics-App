@@ -91,6 +91,11 @@ def parse_event_date(val):
 
 
 def best_matching_col(df: pd.DataFrame, keywords, hard_excludes=None):
+    """
+    If multiple columns match, pick best using:
+      1) strongest keyword hit (longest keyword)
+      2) most non-null values
+    """
     hard_excludes = hard_excludes or []
     scored = []
     for c in df.columns:
@@ -120,6 +125,10 @@ def row_is_numeric_only(r):
 
 
 def is_probably_event_col(series: pd.Series) -> bool:
+    """
+    Keep only columns that look like attendance (yes/no/1/0/attended etc).
+    This helps align event detection across inconsistent sheets.
+    """
     s = series.dropna().astype(str).str.strip().str.lower()
     if s.empty:
         return False
@@ -128,10 +137,10 @@ def is_probably_event_col(series: pd.Series) -> bool:
     return frac >= 0.5
 
 
-def safe_datetime_range_with_padding(dates, pad_days=2):
+def safe_datetime_range_with_padding(dates, pad_days=3):
     """
-    Ensures all points are visible on plotly date axes by adding padding on both ends.
-    Handles edge cases where min==max.
+    Ensures all points are visible on Plotly date axes by adding padding.
+    Handles edge cases where min == max.
     """
     dates = [d for d in dates if pd.notna(d)]
     if not dates:
@@ -154,7 +163,7 @@ def load_sheet_structured(raw: pd.DataFrame):
     """
     Robust across your workbook (including PG - B3 & B4):
     - Header row = first row (top ~40) containing 'Student Name' or 'Student Names'
-    - Date row   = the row ABOVE header with the MOST parseable dates (search up to 6 rows)
+    - Date row   = row ABOVE header with MOST parseable dates (search up to 6 rows)
     - Event row  = date_row - 1 (event names)
     """
     header_row = None
@@ -316,7 +325,7 @@ metadata_cols = {
 }
 event_cols = [c for c in df.columns if c not in metadata_cols]
 
-# Keep only columns that look like attendance
+# Keep only columns that look like attendance (align across sheets)
 event_cols = [c for c in event_cols if is_probably_event_col(df[c])]
 
 # Normalize event columns
@@ -349,7 +358,7 @@ def conv_category(r):
 
 df["conversion_category"] = df.apply(conv_category, axis=1)
 
-# Retention
+# Retention (paid + attended event whose date > payment date)
 event_dates = meta.get("event_dates", {}) or {}
 
 def retained_flag(r):
@@ -358,7 +367,6 @@ def retained_flag(r):
     pay = r.get(payment_col, pd.NaT)
     if pd.isna(pay):
         return 0
-
     if not event_dates:
         return 1 if r.get("participation_count", 0) > 0 else 0
 
@@ -536,13 +544,13 @@ else:
 st.divider()
 
 # =========================
-# 📈 Upgrades: Payment & Participation Insights
+# 📈 Insights (replaces pie chart)
 # =========================
-st.header("📈 Payment & Participation Insights")
+st.header("📈 Insights")
 
 # A) Participation vs Lead Score (colored by conversion)
+st.subheader("A) Participation vs Lead Score (Filtered)")
 if len(fdf) > 0:
-    st.subheader("A) Participation vs Lead Score (Filtered)")
     fig_sc = px.scatter(
         fdf,
         x="participation_count",
@@ -556,10 +564,9 @@ if len(fdf) > 0:
 else:
     st.info("No rows available in the filtered view for plotting.")
 
-# B) Engagement around Payment Date (before/after), requires payment_col + event_dates
+# B) Engagement around payment date (before/after)
+st.subheader("B) Engagement Before vs After Payment Date (Filtered)")
 if payment_col and event_dates and event_cols and len(fdf) > 0:
-    st.subheader("B) Engagement Before vs After Payment Date (Filtered)")
-
     rows = []
     for _, r in fdf.iterrows():
         pay = r.get(payment_col, pd.NaT)
@@ -615,14 +622,140 @@ if payment_col and event_dates and event_cols and len(fdf) > 0:
         fig_pay.add_vline(x=0, line_dash="dash")
         fig_pay.update_layout(height=420, margin=dict(l=10, r=10, t=60, b=10))
         st.plotly_chart(fig_pay, use_container_width=True)
-
         st.caption("Day 0 = payment date. Positive days = events after payment.")
 else:
-    st.info("Engagement around payment date requires both Payment Date and Event Dates for this sheet.")
+    st.info("Needs both Payment Date and Event Dates for this sheet.")
 
-# C) Quick action lists
+# C) Event Conversion Impact: Paid rate among attendees (strong signal)
+st.subheader("C) Event Conversion Impact (Paid rate among attendees)")
+if event_cols and len(fdf) > 0:
+    rows = []
+    for ev in event_cols:
+        attendees = fdf[fdf[ev] == 1]
+        n_att = len(attendees)
+        if n_att == 0:
+            continue
+        paid_rate = (attendees["conversion_category"].eq("Paid / Admitted").mean()) * 100
+        rows.append({"Event": ev, "Attendees": n_att, "Paid Rate % (Attendees)": round(paid_rate, 1)})
+
+    impact = pd.DataFrame(rows)
+    if impact.empty:
+        st.info("No attendee data found for events in this filtered view.")
+    else:
+        impact = impact.sort_values(["Paid Rate % (Attendees)", "Attendees"], ascending=False)
+        min_att = st.slider(
+            "Minimum attendees to include an event",
+            1,
+            max(1, int(impact["Attendees"].max())),
+            min(10, max(1, int(impact["Attendees"].max()))),
+        )
+        impact_f = impact[impact["Attendees"] >= min_att]
+        if impact_f.empty:
+            st.info("No events meet the minimum attendee threshold.")
+        else:
+            fig_imp = px.bar(
+                impact_f,
+                x="Event",
+                y="Paid Rate % (Attendees)",
+                hover_data=["Attendees"],
+                title="Paid/Admitted rate among attendees (higher = stronger conversion signal)",
+            )
+            fig_imp.update_layout(xaxis_tickangle=-45, height=420, margin=dict(l=10, r=10, t=60, b=120))
+            st.plotly_chart(fig_imp, use_container_width=True)
+else:
+    st.info("No event columns detected.")
+
+# D) Engagement → Conversion funnel (bucketed participation)
+st.subheader("D) Engagement → Conversion Funnel (by participation buckets)")
 if len(fdf) > 0:
-    st.subheader("C) Quick Action Lists (Filtered)")
+    tmp = fdf.copy()
+    tmp["eng_bucket"] = pd.cut(
+        tmp["participation_count"],
+        bins=[-1, 0, 2, 5, 999999],
+        labels=["0", "1–2", "3–5", "6+"],
+    )
+
+    funnel = (
+        tmp.groupby(["eng_bucket", "conversion_category"], as_index=False)
+        .size()
+        .rename(columns={"size": "Students"})
+    )
+
+    fig_fun = px.bar(
+        funnel,
+        x="eng_bucket",
+        y="Students",
+        color="conversion_category",
+        barmode="stack",
+        title="How conversion changes with participation level",
+    )
+    fig_fun.update_layout(height=420, margin=dict(l=10, r=10, t=60, b=10))
+    st.plotly_chart(fig_fun, use_container_width=True)
+else:
+    st.info("No rows available in the filtered view for funnel.")
+
+# E) Cohort heatmap: Event × Batch (or Country)
+st.subheader("E) Cohort Heatmap (Participation % by Event)")
+group_col = batch_col or country_col
+if group_col and event_cols and len(fdf) > 0:
+    heat = fdf.copy()
+    heat[group_col] = heat[group_col].astype(str).map(clean_text)
+
+    grp_sizes = heat.groupby(group_col)[name_col].count()
+    groups = [g for g in grp_sizes.index.tolist() if g]
+
+    mat = []
+    for g in groups:
+        gdf = heat[heat[group_col] == g]
+        denom = max(len(gdf), 1)
+        row = {"Group": g}
+        for ev in event_cols:
+            row[ev] = round((gdf[ev].sum() / denom) * 100, 1)
+        mat.append(row)
+
+    mat_df = pd.DataFrame(mat).set_index("Group")
+    if mat_df.empty:
+        st.info("Not enough cohort data to build the heatmap.")
+    else:
+        fig_hm = px.imshow(
+            mat_df,
+            aspect="auto",
+            title=f"Participation % by Event across {group_col}",
+        )
+        fig_hm.update_layout(height=520, margin=dict(l=10, r=10, t=60, b=10))
+        st.plotly_chart(fig_hm, use_container_width=True)
+else:
+    st.info("Heatmap needs Batch/Country and event columns.")
+
+# F) Pareto: do a few events drive most participation?
+st.subheader("F) Pareto (80/20) — Event contribution to total participation")
+if event_cols and len(fdf) > 0:
+    event_counts = fdf[event_cols].sum().sort_values(ascending=False)
+    if event_counts.sum() == 0:
+        st.info("No event participation in current filtered view.")
+    else:
+        pareto = pd.DataFrame({"Event": event_counts.index, "Participants": event_counts.values.astype(int)})
+        pareto["Cumulative %"] = (pareto["Participants"].cumsum() / pareto["Participants"].sum() * 100).round(1)
+
+        fig_par = go.Figure()
+        fig_par.add_trace(go.Bar(x=pareto["Event"], y=pareto["Participants"], name="Participants"))
+        fig_par.add_trace(go.Scatter(x=pareto["Event"], y=pareto["Cumulative %"], yaxis="y2", name="Cumulative %"))
+        fig_par.update_layout(
+            title="Event counts + cumulative share (Pareto)",
+            xaxis_tickangle=-45,
+            height=460,
+            margin=dict(l=10, r=10, t=60, b=140),
+            yaxis=dict(title="Participants"),
+            yaxis2=dict(title="Cumulative %", overlaying="y", side="right", range=[0, 100]),
+            showlegend=True,
+        )
+        st.plotly_chart(fig_par, use_container_width=True)
+else:
+    st.info("Pareto needs event columns.")
+
+# G) Quick action lists
+st.subheader("G) Quick Action Lists (Filtered)")
+if len(fdf) > 0:
     colA, colB = st.columns(2)
 
     with colA:
@@ -644,6 +777,8 @@ if len(fdf) > 0:
             .head(15)
         )
         st.dataframe(risks, use_container_width=True, height=320)
+else:
+    st.info("No rows available for action lists.")
 
 st.divider()
 
@@ -671,7 +806,7 @@ else:
     st.dataframe(low_paid[cols_lp], use_container_width=True, height=320)
 
 # =========================
-# 6️⃣ Event-wise participation
+# 6️⃣ Event-wise participation (table + bar only, pie removed)
 # =========================
 st.header("6️⃣ Event-wise Participation (Filtered)")
 
@@ -694,18 +829,6 @@ else:
     fig_bar.update_layout(xaxis_tickangle=-45, height=420, margin=dict(l=10, r=10, t=40, b=120))
     st.plotly_chart(fig_bar, use_container_width=True)
 
-    # Slider safe even for small #events
-    n_events = len(event_table)
-    min_n = 1 if n_events < 5 else 5
-    max_n = max(min(25, n_events), min_n)
-    default_n = min(12, max_n)
-    top_n = st.slider("Pie chart: number of top events", min_n, max_n, default_n)
-
-    pie_df = event_table.head(top_n).copy()
-    fig_pie = px.pie(pie_df, names="Event", values="Participants", hole=0.35)
-    fig_pie.update_layout(height=420, margin=dict(l=10, r=10, t=40, b=10))
-    st.plotly_chart(fig_pie, use_container_width=True)
-
 # =========================
 # 6b️⃣ Participation trend over time (if event dates exist)
 # =========================
@@ -719,8 +842,7 @@ if event_dates and event_cols:
         trend_df = trend_df.sort_values("Event Date")
 
         fig_tr = px.line(trend_df, x="Event Date", y="Participants", markers=True)
-        # Force full range visible
-        rng = safe_datetime_range_with_padding(trend_df["Event Date"].tolist(), pad_days=2)
+        rng = safe_datetime_range_with_padding(trend_df["Event Date"].tolist(), pad_days=3)
         if rng:
             fig_tr.update_xaxes(range=rng)
         fig_tr.update_layout(height=360, margin=dict(l=10, r=10, t=40, b=10))
@@ -751,7 +873,7 @@ else:
             key=lambda ev: (pd.isna(event_dates.get(ev, pd.NaT)), event_dates.get(ev, pd.NaT)),
         )
 
-    x_vals, x_labels, attended = [], [], []
+    x_vals, attended = [], []
     event_dt_list = []
     for i, ev in enumerate(timeline_events, start=1):
         if use_dates and pd.notna(event_dates.get(ev, pd.NaT)):
@@ -760,15 +882,10 @@ else:
             event_dt_list.append(dt)
         else:
             x_vals.append(i)
-        x_labels.append(ev)
         attended.append(int(row.get(ev, 0)))
 
-    # Better visibility: split attended/missed markers so nothing "looks missing"
-    attended_x = []
-    attended_y = []
-    missed_x = []
-    missed_y = []
-
+    attended_x, attended_y = [], []
+    missed_x, missed_y = [], []
     for xv, a in zip(x_vals, attended):
         if a == 1:
             attended_x.append(xv)
@@ -779,19 +896,18 @@ else:
 
     fig = go.Figure()
 
-    # Draw a faint baseline to make reading easier
+    # faint baseline
     fig.add_trace(go.Scatter(
         x=x_vals,
         y=[0.5] * len(x_vals),
         mode="lines",
-        name="",
         hoverinfo="skip",
         showlegend=False,
         line=dict(width=1, dash="dot"),
         opacity=0.25,
     ))
 
-    # Attended markers (with connecting line through attended points only)
+    # attended: connect only attended points
     fig.add_trace(go.Scatter(
         x=attended_x, y=attended_y,
         mode="lines+markers",
@@ -799,7 +915,7 @@ else:
         connectgaps=False
     ))
 
-    # Missed markers
+    # missed
     fig.add_trace(go.Scatter(
         x=missed_x, y=missed_y,
         mode="markers",
@@ -816,7 +932,7 @@ else:
                 text=["<b>✔ Payment</b>"],
                 textposition="top center",
                 name="Payment Date",
-                marker=dict(symbol="star", size=16, color="green"),
+                marker=dict(symbol="star", size=18, color="green"),
                 textfont=dict(size=14, color="green"),
             ))
         else:
@@ -825,30 +941,32 @@ else:
                 text=["<b>✔ Payment</b>"],
                 textposition="top center",
                 name="Payment Date",
-                marker=dict(symbol="star", size=16, color="green"),
+                marker=dict(symbol="star", size=18, color="green"),
                 textfont=dict(size=14, color="green"),
             ))
 
     fig.update_yaxes(range=[-0.2, 1.3], tickvals=[0, 1], title="Participation (1=Attended, 0=Missed)")
     fig.update_layout(
         height=560,
-        margin=dict(l=10, r=10, t=60, b=90),
+        margin=dict(l=10, r=10, t=60, b=80),
         title=f"Timeline — {selected_student}",
         xaxis_title="Event Date" if use_dates else "Event Sequence",
         showlegend=True
     )
 
-    # ✅ Make sure start/end events never get clipped (padding on both ends)
+    # Make sure start/end events never get clipped (padding + fixed autorange off)
     if use_dates and event_dt_list:
-        rng = safe_datetime_range_with_padding(event_dt_list, pad_days=3)
+        rng = safe_datetime_range_with_padding(event_dt_list, pad_days=4)
         if rng:
-            fig.update_xaxes(range=rng)
+            fig.update_xaxes(range=rng, autorange=False)
+        # Make room for the payment label on top
+        fig.update_layout(margin=dict(l=10, r=10, t=70, b=90))
 
     if not use_dates:
         fig.update_xaxes(
             tickmode="array",
             tickvals=list(range(1, len(timeline_events) + 1)),
-            ticktext=x_labels,
+            ticktext=timeline_events,
             tickangle=-45
         )
 
