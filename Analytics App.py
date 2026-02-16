@@ -7,7 +7,6 @@ import plotly.graph_objects as go
 
 st.set_page_config(page_title="Engagement Analytics Dashboard", layout="wide")
 
-
 # =========================
 # Helpers
 # =========================
@@ -42,7 +41,6 @@ def make_unique(cols):
 
 
 def normalize_binary(x) -> int:
-    # crash-proof for any weird cell values
     try:
         if x is None:
             return 0
@@ -66,8 +64,8 @@ def parse_event_date(val):
     Handles:
       - Timestamp-like
       - '2026-01-24 00:00:00'
-      - '28-30.01.2026'
-      - '28-01 to 30.01.2026'
+      - '28-30.01.2026'  (takes start date)
+      - '28.01 to 30.01.2026' (takes start date)
     Returns Timestamp (normalized) or NaT.
     """
     try:
@@ -81,6 +79,7 @@ def parse_event_date(val):
     if not s:
         return pd.NaT
 
+    # capture first dd mm yyyy anywhere
     m = re.search(r"(\d{1,2})\D+(\d{1,2})\D+(\d{4})", s)
     if not m:
         return pd.NaT
@@ -92,34 +91,39 @@ def parse_event_date(val):
         return pd.NaT
 
 
-def best_matching_col(df: pd.DataFrame, keywords):
+def best_matching_col(df: pd.DataFrame, keywords, hard_excludes=None):
     """
-    If multiple columns match (e.g., duplicate 'Conversion Status'),
-    pick the one with the most non-null values.
+    If multiple columns match, pick the one with:
+      1) strongest keyword match (longer keyword hit)
+      2) most non-null values
     """
-    matches = []
+    hard_excludes = hard_excludes or []
+    scored = []
     for c in df.columns:
         cl = clean_text(c).lower()
-        if any(k in cl for k in keywords):
-            matches.append(c)
-    if not matches:
+        if any(ex in cl for ex in hard_excludes):
+            continue
+
+        hit_strength = 0
+        for k in keywords:
+            if k in cl:
+                hit_strength = max(hit_strength, len(k))
+
+        if hit_strength > 0:
+            scored.append((c, hit_strength, df[c].notna().sum()))
+
+    if not scored:
         return None
-    if len(matches) == 1:
-        return matches[0]
-    nn = [(c, df[c].notna().sum()) for c in matches]
-    nn.sort(key=lambda x: x[1], reverse=True)
-    return nn[0][0]
+
+    scored.sort(key=lambda x: (x[1], x[2]), reverse=True)
+    return scored[0][0]
 
 
-def drop_summary_rows(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.dropna(how="all")
-    def row_is_numeric_only(r):
-        vals = [str(v).strip() for v in r.tolist() if str(v).strip() not in ("", "nan", "NaN")]
-        if not vals:
-            return True
-        return all(re.fullmatch(r"\d+(\.\d+)?", v) for v in vals)
-    mask = df.apply(row_is_numeric_only, axis=1)
-    return df.loc[~mask].copy()
+def row_is_numeric_only(r):
+    vals = [str(v).strip() for v in r.tolist() if str(v).strip() not in ("", "nan", "NaN")]
+    if not vals:
+        return True
+    return all(re.fullmatch(r"\d+(\.\d+)?", v) for v in vals)
 
 
 # =========================
@@ -127,31 +131,31 @@ def drop_summary_rows(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 def load_sheet_structured(raw: pd.DataFrame):
     """
-    Deterministic for YOUR workbook:
-    - Header row = first row (top ~12) containing 'Student Name' or 'Student Names'
+    Deterministic for your workbook:
+    - Header row = first row (top ~30) containing 'Student Name' or 'Student Names'
     - Date row   = header_row - 1
     - Event row  = header_row - 2
     """
     header_row = None
-    for i in range(min(12, len(raw))):
+    for i in range(min(30, len(raw))):
         row_text = " | ".join([clean_text(v).lower() for v in raw.iloc[i, :].tolist()])
         if "student name" in row_text or "student names" in row_text:
             header_row = i
             break
 
     if header_row is None:
-        return None, None, "Could not find 'Student Name(s)' header row in top 12 rows."
+        return None, None, "Could not find 'Student Name(s)' header row in top rows."
 
     date_row = header_row - 1 if header_row - 1 >= 0 else None
     event_row = header_row - 2 if header_row - 2 >= 0 else None
 
     header_cells = [clean_text(x) for x in raw.iloc[header_row, :].tolist()]
-    event_cells = [clean_text(x) for x in raw.iloc[event_row, :].tolist()] if event_row is not None else [""] * len(header_cells)
+    event_cells = (
+        [clean_text(x) for x in raw.iloc[event_row, :].tolist()]
+        if event_row is not None
+        else [""] * len(header_cells)
+    )
 
-    # Build columns:
-    # - use header cell if present
-    # - else use event name cell if present
-    # - else fallback Unnamed_i
     cols = []
     for j, h in enumerate(header_cells):
         if h:
@@ -162,12 +166,13 @@ def load_sheet_structured(raw: pd.DataFrame):
             cols.append(f"Unnamed_{j}")
     cols = make_unique(cols)
 
-    df = raw.iloc[header_row + 1:, :].copy()
+    df = raw.iloc[header_row + 1 :, :].copy()
     df.columns = cols
     df = df.reset_index(drop=True)
-    df = drop_summary_rows(df)
 
-    # Event-date mapping from date_row
+    # Drop only fully-empty rows here; summary-like row dropping is safer AFTER we know name_col
+    df = df.dropna(how="all")
+
     event_dates = {}
     if date_row is not None:
         date_cells = raw.iloc[date_row, :].tolist()
@@ -177,8 +182,24 @@ def load_sheet_structured(raw: pd.DataFrame):
                 if pd.notna(dt):
                     event_dates[col] = dt
 
-    meta = {"header_row": header_row, "event_row": event_row, "date_row": date_row, "event_dates": event_dates}
+    meta = {
+        "header_row": header_row,
+        "event_row": event_row,
+        "date_row": date_row,
+        "event_dates": event_dates,
+    }
     return df, meta, None
+
+
+@st.cache_data(show_spinner=False)
+def get_sheet_names(file_bytes):
+    xls = pd.ExcelFile(file_bytes)
+    return xls.sheet_names
+
+
+@st.cache_data(show_spinner=False)
+def read_raw_sheet(file_bytes, sheet_name):
+    return pd.read_excel(file_bytes, sheet_name=sheet_name, header=None).dropna(how="all")
 
 
 # =========================
@@ -190,15 +211,15 @@ uploaded_file = st.file_uploader("Upload Master Engagement Tracker Excel File", 
 if not uploaded_file:
     st.stop()
 
-xls = pd.ExcelFile(uploaded_file)
-all_sheets = xls.sheet_names
+file_bytes = uploaded_file.getvalue()
 
-# Ignore first sheet as requested
-sheets = all_sheets[1:] if len(all_sheets) > 1 else all_sheets
+all_sheets = get_sheet_names(file_bytes)
 
-selected_sheet = st.sidebar.selectbox("Select Sheet (first sheet ignored)", sheets)
+# ✅ Ignore first 2 sheets as requested
+sheets = all_sheets[2:] if len(all_sheets) > 2 else all_sheets
+selected_sheet = st.sidebar.selectbox("Select Sheet (first 2 sheets ignored)", sheets)
 
-raw = pd.read_excel(uploaded_file, sheet_name=selected_sheet, header=None).dropna(how="all")
+raw = read_raw_sheet(file_bytes, selected_sheet)
 
 df, meta, err = load_sheet_structured(raw)
 if err:
@@ -207,7 +228,10 @@ if err:
 
 # Keyword maps for metadata
 KW = {
-    "name": ["student name", "student names", "name", "full name"],
+    # Safer: avoid super-broad "name" matching unless nothing else found
+    "name_strict": ["student name", "student names", "full name", "learner name"],
+    "name_fallback": ["name"],
+
     "email": ["email", "e mail", "e-mail"],
     "phone": ["phone", "mobile", "mobile no", "phone number"],
     "country": ["country"],
@@ -220,7 +244,11 @@ KW = {
 }
 
 # Detect metadata columns (choose best if duplicates exist)
-name_col = best_matching_col(df, KW["name"])
+name_col = best_matching_col(df, KW["name_strict"])
+if not name_col:
+    # fallback, but avoid "batch name"/etc if present
+    name_col = best_matching_col(df, KW["name_fallback"], hard_excludes=["batch", "program", "session", "event"])
+
 email_col = best_matching_col(df, KW["email"])
 phone_col = best_matching_col(df, KW["phone"])
 country_col = best_matching_col(df, KW["country"])
@@ -232,12 +260,24 @@ community_col = best_matching_col(df, KW["community_status"])
 exit_col = best_matching_col(df, KW["date_of_exit"])
 
 if not name_col:
-    st.error("❌ Student Name column not detected after parsing (unexpected).")
+    st.error("❌ Student Name column not detected after parsing.")
     st.stop()
 
+# ✅ Now safely drop summary-like numeric rows only when name is blank
+name_series = df[name_col].astype(str).map(lambda x: clean_text(x))
+numeric_mask = df.apply(row_is_numeric_only, axis=1)
+blank_name_mask = name_series.map(lambda x: x == "" or x.lower() == "nan")
+df = df.loc[~(numeric_mask & blank_name_mask)].copy()
+
 # Event columns = everything except metadata columns
-metadata_cols = {c for c in [name_col, email_col, phone_col, country_col, batch_col,
-                             conversion_col, payment_col, engagement_col, community_col, exit_col] if c}
+metadata_cols = {
+    c
+    for c in [
+        name_col, email_col, phone_col, country_col, batch_col,
+        conversion_col, payment_col, engagement_col, community_col, exit_col
+    ]
+    if c
+}
 event_cols = [c for c in df.columns if c not in metadata_cols]
 
 # Normalize event columns
@@ -257,7 +297,7 @@ if not conversion_col:
     conversion_col = "Conversion Status"
 df[conversion_col] = df[conversion_col].astype(str).map(lambda x: clean_text(x).lower())
 
-# Paid definition per your rule:
+# Paid definition:
 # Paid/Admitted if payment date exists OR conversion contains admitted/paid
 def conv_category(r):
     if payment_col and pd.notna(r.get(payment_col, pd.NaT)):
@@ -280,7 +320,8 @@ def retained_flag(r):
     pay = r.get(payment_col, pd.NaT)
     if pd.isna(pay):
         return 0
-    # If we have no event dates for this sheet, fallback to any participation
+
+    # If we have no event dates for this sheet, fallback to any participation (but warn in UI)
     if not event_dates:
         return 1 if r.get("participation_count", 0) > 0 else 0
 
@@ -295,7 +336,7 @@ def retained_flag(r):
 df["retained"] = df.apply(retained_flag, axis=1)
 retention_rate = float(df["retained"].mean() * 100) if payment_col else None
 
-# Lead scoring (your notebook-style)
+# Lead scoring
 def lead_score(r):
     score = int(r.get("participation_count", 0)) * 10
     for ev in event_cols:
@@ -319,36 +360,84 @@ def lead_score(r):
 df["lead_score"] = df.apply(lead_score, axis=1)
 
 # =========================
+# Sidebar filters (dashboard upgrade)
+# =========================
+st.sidebar.markdown("### Filters")
+
+conv_filter = st.sidebar.multiselect(
+    "Conversion category",
+    ["Paid / Admitted", "Will Pay", "Not Paid"],
+    default=["Paid / Admitted", "Will Pay", "Not Paid"],
+)
+
+min_part = st.sidebar.slider("Minimum participation count", 0, int(df["participation_count"].max() or 0), 0)
+
+batch_filter = None
+if batch_col:
+    batches = sorted([b for b in df[batch_col].dropna().astype(str).map(clean_text).unique().tolist() if b])
+    batch_filter = st.sidebar.multiselect("Batch", batches, default=batches)
+
+country_filter = None
+if country_col:
+    countries = sorted([c for c in df[country_col].dropna().astype(str).map(clean_text).unique().tolist() if c])
+    country_filter = st.sidebar.multiselect("Country", countries, default=countries)
+
+search_text = st.sidebar.text_input("Search student (contains)", "")
+
+fdf = df.copy()
+fdf = fdf[fdf["conversion_category"].isin(conv_filter)]
+fdf = fdf[fdf["participation_count"] >= min_part]
+if batch_col and batch_filter is not None:
+    fdf = fdf[fdf[batch_col].astype(str).map(clean_text).isin(set(batch_filter))]
+if country_col and country_filter is not None:
+    fdf = fdf[fdf[country_col].astype(str).map(clean_text).isin(set(country_filter))]
+if search_text.strip():
+    q = search_text.strip().lower()
+    fdf = fdf[fdf[name_col].astype(str).str.lower().str.contains(q, na=False)]
+
+# =========================
 # Top metrics
 # =========================
 total_students = int(df[name_col].notna().sum())
 active_students = int((df["participation_count"] > 0).sum())
 paid_count = int((df["conversion_category"] == "Paid / Admitted").sum())
-will_pay_count = int((df["conversion_category"] == "Will Pay").sum())
-not_paid_count = int((df["conversion_category"] == "Not Paid").sum())
 participants = int((df["participation_count"] > 0).sum())
 conversion_rate = (paid_count / participants * 100) if participants else 0.0
 
+# filtered metrics
+f_total = int(fdf[name_col].notna().sum())
+f_active = int((fdf["participation_count"] > 0).sum())
+f_paid = int((fdf["conversion_category"] == "Paid / Admitted").sum())
+f_participants = int((fdf["participation_count"] > 0).sum())
+f_conv_rate = (f_paid / f_participants * 100) if f_participants else 0.0
+
 st.caption(
     f"Parsed '{selected_sheet}' using: header_row={meta['header_row']}, event_row={meta['event_row']}, date_row={meta['date_row']} | "
-    f"Detected events: {len(event_cols)}"
+    f"Detected events: {len(event_cols)} | Rows: {len(df)}"
 )
 
+if payment_col and not event_dates:
+    st.warning("Retention: this sheet has Payment Date but no event dates parsed → retention falls back to “any participation after payment (unknown)”. Interpret carefully.")
+
 m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Total Students", total_students)
-m2.metric("Active Students", active_students)
-m3.metric("Paid / Admitted", paid_count)
-m4.metric("Conversion Rate", f"{conversion_rate:.1f}%")
+m1.metric("Total Students (All)", total_students, f"Filtered: {f_total}")
+m2.metric("Active Students (All)", active_students, f"Filtered: {f_active}")
+m3.metric("Paid / Admitted (All)", paid_count, f"Filtered: {f_paid}")
+m4.metric("Conversion Rate (All)", f"{conversion_rate:.1f}%", f"Filtered: {f_conv_rate:.1f}%")
 m5.metric("Retention Rate", f"{(retention_rate or 0):.1f}%" if payment_col else "N/A")
+
+# Download filtered view
+csv = fdf.to_csv(index=False).encode("utf-8")
+st.download_button("⬇️ Download filtered data (CSV)", data=csv, file_name=f"{selected_sheet}_filtered.csv", mime="text/csv")
 
 st.divider()
 
 # =========================
 # 1️⃣ Top participating
 # =========================
-st.header("1️⃣ Top Participating Students")
+st.header("1️⃣ Top Participating Students (Filtered)")
 st.dataframe(
-    df.sort_values("participation_count", ascending=False)[
+    fdf.sort_values("participation_count", ascending=False)[
         [name_col, "participation_count", "conversion_category", "lead_score"]
     ].head(100),
     use_container_width=True,
@@ -358,11 +447,11 @@ st.dataframe(
 # =========================
 # 2️⃣ Payment & Conversion
 # =========================
-st.header("2️⃣ Payment & Conversion Analysis")
+st.header("2️⃣ Payment & Conversion Analysis (Filtered)")
 
-paid_df = df[df["conversion_category"] == "Paid / Admitted"].copy()
-will_df = df[df["conversion_category"] == "Will Pay"].copy()
-not_df = df[df["conversion_category"] == "Not Paid"].copy()
+paid_df = fdf[fdf["conversion_category"] == "Paid / Admitted"].copy()
+will_df = fdf[fdf["conversion_category"] == "Will Pay"].copy()
+not_df = fdf[fdf["conversion_category"] == "Not Paid"].copy()
 
 cols_paid = [name_col, conversion_col, "participation_count"]
 if payment_col:
@@ -379,8 +468,8 @@ with c3:
     st.subheader("🔴 Not Paid")
     st.dataframe(not_df[[name_col, conversion_col, "participation_count"]], use_container_width=True, height=280)
 
-st.subheader("Conversion Status Values (Raw)")
-raw_conv = df[conversion_col].replace({"": np.nan, "nan": np.nan}).dropna()
+st.subheader("Conversion Status Values (Raw, Filtered)")
+raw_conv = fdf[conversion_col].replace({"": np.nan, "nan": np.nan}).dropna()
 raw_conv_counts = raw_conv.value_counts().reset_index()
 raw_conv_counts.columns = ["Conversion Status", "Count"]
 st.dataframe(raw_conv_counts, use_container_width=True, height=240)
@@ -388,10 +477,11 @@ st.dataframe(raw_conv_counts, use_container_width=True, height=240)
 # =========================
 # 3️⃣ Retention
 # =========================
-st.header("3️⃣ Retention Analysis (PG sheets)")
+st.header("3️⃣ Retention Analysis (PG sheets) (Filtered)")
 if payment_col:
-    st.metric("Overall Retention Rate", f"{(retention_rate or 0):.2f}%")
-    retained = df[df["retained"] == 1][[name_col, payment_col, "participation_count"]].copy()
+    f_ret = float(fdf["retained"].mean() * 100) if len(fdf) else 0.0
+    st.metric("Retention Rate (Filtered)", f"{f_ret:.2f}%")
+    retained = fdf[fdf["retained"] == 1][[name_col, payment_col, "participation_count"]].copy()
     st.subheader("Retained Students (paid + attended after payment date)")
     st.dataframe(retained, use_container_width=True, height=280)
 else:
@@ -400,17 +490,17 @@ else:
 # =========================
 # 4️⃣ No participation
 # =========================
-st.header("4️⃣ Students With NO Event Participation")
+st.header("4️⃣ Students With NO Event Participation (Filtered)")
 cols_no = [name_col, conversion_col]
 if payment_col:
     cols_no.append(payment_col)
-st.dataframe(df[df["participation_count"] == 0][cols_no], use_container_width=True, height=320)
+st.dataframe(fdf[fdf["participation_count"] == 0][cols_no], use_container_width=True, height=320)
 
 # =========================
 # 5️⃣ Paid low/no engagement
 # =========================
-st.header("5️⃣ Paid Students With Low / No Engagement")
-low_paid = df[(df["conversion_category"] == "Paid / Admitted") & (df["participation_count"] <= 1)].copy()
+st.header("5️⃣ Paid Students With Low / No Engagement (Filtered)")
+low_paid = fdf[(fdf["conversion_category"] == "Paid / Admitted") & (fdf["participation_count"] <= 1)].copy()
 if low_paid.empty:
     st.success("No paid students with 0–1 participation found.")
 else:
@@ -423,13 +513,13 @@ else:
 # =========================
 # 6️⃣ Event-wise participation
 # =========================
-st.header("6️⃣ Event-wise Participation")
+st.header("6️⃣ Event-wise Participation (Filtered)")
 
 if not event_cols:
     st.info("No event columns detected after parsing.")
 else:
-    event_counts = df[event_cols].sum().sort_values(ascending=False)
-    event_pct = (event_counts / max(len(df), 1) * 100).round(1)
+    event_counts = fdf[event_cols].sum().sort_values(ascending=False)
+    event_pct = (event_counts / max(len(fdf), 1) * 100).round(1)
 
     event_table = pd.DataFrame({
         "Event": event_counts.index,
@@ -442,28 +532,58 @@ else:
     fig_bar.update_layout(xaxis_tickangle=-45, height=420, margin=dict(l=10, r=10, t=40, b=120))
     st.plotly_chart(fig_bar, use_container_width=True)
 
-    top_n = st.slider("Pie chart: number of top events", 5, min(25, len(event_table)), min(12, len(event_table)))
+    # ✅ FIXED slider: never invalid range
+    n_events = len(event_table)
+    min_n = 1 if n_events < 5 else 5
+    max_n = max(min(25, n_events), min_n)
+    default_n = min(12, max_n)
+
+    top_n = st.slider("Pie chart: number of top events", min_n, max_n, default_n)
     pie_df = event_table.head(top_n).copy()
     fig_pie = px.pie(pie_df, names="Event", values="Participants", hole=0.35)
     fig_pie.update_layout(height=420, margin=dict(l=10, r=10, t=40, b=10))
     st.plotly_chart(fig_pie, use_container_width=True)
 
 # =========================
+# 6b️⃣ Participation trend over time (if event dates exist)
+# =========================
+st.header("6b️⃣ Participation Trend Over Time")
+if event_dates:
+    # build a date->count series across events
+    dmap = {ev: event_dates.get(ev, pd.NaT) for ev in event_cols}
+    dated_events = [(ev, dt) for ev, dt in dmap.items() if pd.notna(dt)]
+    if dated_events:
+        trend = []
+        for ev, dt in dated_events:
+            trend.append((dt, int(fdf[ev].sum())))
+        trend_df = pd.DataFrame(trend, columns=["Event Date", "Participants"]).groupby("Event Date", as_index=False).sum()
+        trend_df = trend_df.sort_values("Event Date")
+        fig_tr = px.line(trend_df, x="Event Date", y="Participants", markers=True)
+        fig_tr.update_layout(height=360, margin=dict(l=10, r=10, t=40, b=10))
+        st.plotly_chart(fig_tr, use_container_width=True)
+    else:
+        st.info("Event dates exist but none mapped to detected event columns.")
+else:
+    st.info("No event dates detected in this sheet.")
+
+# =========================
 # 7️⃣ Per-student timeline
 # =========================
-st.header("7️⃣ Per-Student Participation Timeline")
+st.header("7️⃣ Per-Student Participation Timeline (Filtered)")
 
-students = df[name_col].dropna().astype(str).unique().tolist()
+students = fdf[name_col].dropna().astype(str).unique().tolist()
 if not students:
-    st.info("No students detected in this sheet.")
+    st.info("No students detected in this filtered view.")
 else:
     selected_student = st.selectbox("Select Student", students)
-    row = df[df[name_col].astype(str) == str(selected_student)].iloc[0]
+    row = fdf[fdf[name_col].astype(str) == str(selected_student)].iloc[0]
 
-    # Sort events by date if available, else keep order
     timeline_events = event_cols[:]
     if event_dates:
-        timeline_events = sorted(timeline_events, key=lambda ev: (pd.isna(event_dates.get(ev, pd.NaT)), event_dates.get(ev, pd.NaT)))
+        timeline_events = sorted(
+            timeline_events,
+            key=lambda ev: (pd.isna(event_dates.get(ev, pd.NaT)), event_dates.get(ev, pd.NaT)),
+        )
 
     use_dates = bool(event_dates)
     x_vals, x_labels, attended = [], [], []
@@ -475,14 +595,13 @@ else:
         x_labels.append(ev)
         attended.append(int(row.get(ev, 0)))
 
-    y_line = [1 if a == 1 else None for a in attended]  # breaks on misses
+    y_line = [1 if a == 1 else None for a in attended]
     y_miss = [0 if a == 0 else None for a in attended]
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=x_vals, y=y_line, mode="lines+markers", name="Attended", connectgaps=False))
     fig.add_trace(go.Scatter(x=x_vals, y=y_miss, mode="markers", name="Missed", marker=dict(symbol="x", size=9)))
 
-    # Payment marker
     if payment_col and pd.notna(row.get(payment_col, pd.NaT)):
         pay_dt = row[payment_col]
         if use_dates:
@@ -520,9 +639,9 @@ else:
 # =========================
 # Lead leaderboard
 # =========================
-st.header("🏆 Lead Score Leaderboard")
+st.header("🏆 Lead Score Leaderboard (Filtered)")
 st.dataframe(
-    df.sort_values("lead_score", ascending=False)[
+    fdf.sort_values("lead_score", ascending=False)[
         [name_col, "lead_score", "participation_count", "conversion_category"]
     ].head(100),
     use_container_width=True,
